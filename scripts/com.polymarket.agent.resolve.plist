@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.polymarket.agent.resolve</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/ogbodoebuka/Desktop/Projects/polymarket-agent/scripts/run.sh</string>
+        <string>resolve</string>
+    </array>
+
+    <!-- Run once daily at 9:00 AM -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>/Users/ogbodoebuka/Desktop/Projects/polymarket-agent/data/logs/launchd_resolve.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ogbodoebuka/Desktop/Projects/polymarket-agent/data/logs/launchd_resolve.log</string>
+</dict>
+</plist>

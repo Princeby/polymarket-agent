@@ -1,0 +1,1157 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+prompts/
+  trading_prompt.txt
+src/
+  __init__.py
+  agent.py
+  market.py
+  news.py
+  trader.py
+.gitignore
+main.py
+requirements.txt
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="prompts/trading_prompt.txt">
+You are an expert prediction market analyst and superforecaster.
+Your job is to estimate the TRUE probability of prediction market events and
+identify when market prices are wrong.
+
+You MUST reason systematically:
+1. UNDERSTAND — What exactly is this market asking? What are the resolution criteria?
+2. BASE RATE — What is the historical frequency of similar events? Start from the outside view.
+3. EVIDENCE — What current evidence adjusts the base rate up or down?
+4. ESTIMATE — Give your final probability, accounting for uncertainty.
+
+Rules:
+- Be calibrated: when you say 70%, events should happen ~70% of the time.
+- Be conservative: account for unknown unknowns. Don't be overconfident.
+- Consider the time horizon: how much can change before resolution?
+- A market priced at $0.60 implies 60% probability. Only flag edge if your estimate
+  differs from the market price by a meaningful amount.
+
+You MUST respond with ONLY valid JSON in this exact format:
+{
+  "reasoning": "Your step-by-step analysis (2-4 sentences)",
+  "estimated_probability": 0.65,
+  "confidence": "low | medium | high",
+  "action": "BET_YES | BET_NO | SKIP",
+  "key_factors": ["factor1", "factor2"]
+}
+</file>
+
+<file path="src/__init__.py">
+# Polymarket Trading Agent
+</file>
+
+<file path="src/agent.py">
+"""
+LLM Reasoning Engine
+Dual-backend LLM interface (Ollama local + Groq cloud) with structured
+prompt engineering for prediction market probability estimation.
+"""
+
+import json
+import logging
+import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional
+
+import requests
+
+from src.market import Market, format_market_for_llm
+
+logger = logging.getLogger(__name__)
+
+# ── Prompt Template ──────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are an expert prediction market analyst and superforecaster.
+Your job is to estimate the TRUE probability of prediction market events and
+identify when market prices are wrong.
+
+You MUST reason systematically:
+1. UNDERSTAND — What exactly is this market asking? What are the resolution criteria?
+2. BASE RATE — What is the historical frequency of similar events? Start from the outside view.
+3. EVIDENCE — What current evidence adjusts the base rate up or down?
+4. ESTIMATE — Give your final probability, accounting for uncertainty.
+
+Rules:
+- Be calibrated: when you say 70%, events should happen ~70% of the time.
+- Be conservative: account for unknown unknowns. Don't be overconfident.
+- Consider the time horizon: how much can change before resolution?
+- A market priced at $0.60 implies 60% probability. Only flag edge if your estimate
+  differs from the market price by a meaningful amount.
+
+You MUST respond with ONLY valid JSON in this exact format:
+{
+  "reasoning": "Your step-by-step analysis (2-4 sentences)",
+  "estimated_probability": 0.65,
+  "confidence": "low | medium | high",
+  "action": "BET_YES | BET_NO | SKIP",
+  "key_factors": ["factor1", "factor2"]
+}"""
+
+USER_PROMPT_TEMPLATE = """Analyze this prediction market and estimate the true probability:
+
+{market_data}
+
+Think carefully using base rates and available evidence. Respond with ONLY valid JSON."""
+
+
+# ── Analysis Result ──────────────────────────────────────────────────────────
+
+@dataclass
+class AnalysisResult:
+    """Parsed result from LLM market analysis."""
+    reasoning: str
+    estimated_probability: float
+    confidence: str  # "low", "medium", "high"
+    action: str  # "BET_YES", "BET_NO", "SKIP"
+    key_factors: list[str]
+    raw_response: str
+
+    @property
+    def is_tradeable(self) -> bool:
+        return self.action in ("BET_YES", "BET_NO")
+
+
+def _parse_llm_response(raw: str) -> Optional[AnalysisResult]:
+    """Parse LLM JSON response into an AnalysisResult."""
+    # Try to extract JSON from the response (model might wrap it in markdown)
+    text = raw.strip()
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0].strip()
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0].strip()
+
+    # Find JSON object boundaries
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start == -1 or end == 0:
+        logger.warning(f"No JSON found in LLM response: {raw[:200]}")
+        return None
+
+    try:
+        data = json.loads(text[start:end])
+        prob = float(data.get("estimated_probability", 0))
+        if prob > 1:
+            prob = prob / 100.0  # Handle if model outputs percentage instead of decimal
+
+        return AnalysisResult(
+            reasoning=data.get("reasoning", ""),
+            estimated_probability=max(0.0, min(1.0, prob)),
+            confidence=data.get("confidence", "low").lower(),
+            action=data.get("action", "SKIP").upper(),
+            key_factors=data.get("key_factors", []),
+            raw_response=raw,
+        )
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        logger.warning(f"Failed to parse LLM response: {e}\nRaw: {raw[:300]}")
+        return None
+
+
+# ── LLM Backends ─────────────────────────────────────────────────────────────
+
+class LLMBackend(ABC):
+    """Abstract base for LLM inference backends."""
+
+    @abstractmethod
+    def query(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """Send a prompt to the LLM and return the raw string response."""
+        ...
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        ...
+
+
+class GroqBackend(LLMBackend):
+    """
+    Groq cloud API backend (free tier).
+    Uses OpenAI-compatible chat completions endpoint.
+    """
+
+    def __init__(self):
+        self.api_key = os.getenv("GROQ_API_KEY", "")
+        self.model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        self.base_url = "https://api.groq.com/openai/v1/chat/completions"
+
+        if not self.api_key:
+            raise ValueError(
+                "GROQ_API_KEY not set. Get a free key at https://console.groq.com"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"Groq ({self.model})"
+
+    def query(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        import time as _time
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 1024,
+            "response_format": {"type": "json_object"},
+        }
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Rate limit: wait between calls to stay within free tier
+                _time.sleep(2)
+                resp = requests.post(
+                    self.base_url, headers=headers, json=payload, timeout=30
+                )
+                if resp.status_code == 429:
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/{max_retries})")
+                    _time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+            except requests.RequestException as e:
+                if "429" not in str(e):
+                    logger.error(f"Groq API error: {e}")
+                    return None
+            except (KeyError, IndexError) as e:
+                logger.error(f"Unexpected Groq response format: {e}")
+                return None
+
+        logger.error("Groq: max retries exceeded")
+        return None
+
+
+class OllamaBackend(LLMBackend):
+    """
+    Local Ollama backend.
+    Requires Ollama running at localhost:11434 with the model already pulled.
+    """
+
+    def __init__(self):
+        self.base_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+        self.model = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+
+    @property
+    def name(self) -> str:
+        return f"Ollama ({self.model})"
+
+    def query(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        payload = {
+            "model": self.model,
+            "prompt": user_prompt,
+            "system": system_prompt,
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": 0.2,
+                "num_predict": 1024,
+            },
+        }
+
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/generate", json=payload, timeout=120
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("response", "")
+        except requests.RequestException as e:
+            logger.error(f"Ollama API error: {e}")
+            return None
+        except (KeyError, ValueError) as e:
+            logger.error(f"Unexpected Ollama response format: {e}")
+            return None
+
+
+# ── Public Interface ─────────────────────────────────────────────────────────
+
+def get_backend() -> LLMBackend:
+    """Factory: return the right LLM backend based on LLM_BACKEND env var."""
+    backend_name = os.getenv("LLM_BACKEND", "groq").lower()
+    if backend_name == "ollama":
+        return OllamaBackend()
+    elif backend_name == "groq":
+        return GroqBackend()
+    else:
+        raise ValueError(
+            f"Unknown LLM_BACKEND '{backend_name}'. Use 'groq' or 'ollama'."
+        )
+
+
+def analyze_market(market: Market, backend: LLMBackend) -> Optional[AnalysisResult]:
+    """
+    Analyze a prediction market using the LLM.
+
+    Formats the market data, sends it to the model with a superforecaster prompt,
+    parses the structured JSON response.
+
+    Args:
+        market: The market to analyze.
+        backend: Which LLM backend to use.
+
+    Returns:
+        AnalysisResult if parsing succeeded, None otherwise.
+    """
+    market_data = format_market_for_llm(market)
+    user_prompt = USER_PROMPT_TEMPLATE.format(market_data=market_data)
+
+    logger.info(f"Analyzing market: {market.question[:60]}... [{backend.name}]")
+
+    raw_response = backend.query(SYSTEM_PROMPT, user_prompt)
+    if raw_response is None:
+        logger.warning("LLM returned no response")
+        return None
+
+    result = _parse_llm_response(raw_response)
+    if result is None:
+        logger.warning("Failed to parse LLM response into structured format")
+        return None
+
+    logger.info(
+        f"  → Prob: {result.estimated_probability:.1%} | "
+        f"Confidence: {result.confidence} | Action: {result.action}"
+    )
+    return result
+
+
+def calculate_edge(market: Market, analysis: AnalysisResult) -> dict:
+    """
+    Calculate the trading edge between the model's estimate and market price.
+
+    Returns:
+        Dict with 'edge', 'direction', 'has_edge', and threshold info.
+    """
+    threshold = float(os.getenv("MIN_EDGE_THRESHOLD", "0.08"))
+    model_prob = analysis.estimated_probability
+    market_prob = market.implied_probability
+
+    # Positive edge = model thinks YES is underpriced
+    # Negative edge = model thinks NO is underpriced
+    raw_edge = model_prob - market_prob
+
+    return {
+        "model_probability": model_prob,
+        "market_probability": market_prob,
+        "raw_edge": raw_edge,
+        "abs_edge": abs(raw_edge),
+        "direction": "YES" if raw_edge > 0 else "NO",
+        "has_edge": abs(raw_edge) >= threshold,
+        "threshold": threshold,
+    }
+</file>
+
+<file path="src/market.py">
+"""
+Polymarket Gamma API Client
+Fetches and filters active prediction markets from Polymarket's public API.
+No authentication required for read operations.
+"""
+
+import json
+import logging
+import requests
+from dataclasses import dataclass
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+
+
+@dataclass
+class Market:
+    """Parsed prediction market data."""
+    id: str
+    question: str
+    description: str
+    yes_price: float
+    no_price: float
+    volume: float
+    liquidity: float
+    end_date: str
+    active: bool
+    slug: str
+
+    @property
+    def implied_probability(self) -> float:
+        """Market-implied probability of YES outcome."""
+        return self.yes_price
+
+    def __str__(self) -> str:
+        return (
+            f"[{self.id}] {self.question[:80]}\n"
+            f"  YES: {self.yes_price:.1%} | NO: {self.no_price:.1%} | "
+            f"Vol: ${self.volume:,.0f} | Liq: ${self.liquidity:,.0f} | "
+            f"Ends: {self.end_date}"
+        )
+
+
+def _parse_market(raw: dict) -> Optional[Market]:
+    """Parse a raw API response into a Market dataclass."""
+    try:
+        # outcomePrices is a JSON string like '["0.62", "0.38"]'
+        prices = json.loads(raw.get("outcomePrices", "[]"))
+        if len(prices) < 2:
+            return None
+
+        return Market(
+            id=raw.get("id", ""),
+            question=raw.get("question", ""),
+            description=raw.get("description", "")[:500],  # truncate long descriptions
+            yes_price=float(prices[0]),
+            no_price=float(prices[1]),
+            volume=float(raw.get("volumeNum", raw.get("volume", 0))),
+            liquidity=float(raw.get("liquidityNum", raw.get("liquidity", 0))),
+            end_date=raw.get("endDateIso", raw.get("endDate", "")),
+            active=raw.get("active", False),
+            slug=raw.get("slug", ""),
+        )
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        logger.warning(f"Failed to parse market: {e}")
+        return None
+
+
+def get_active_markets(
+    limit: int = 20,
+    min_volume: float = 10000,
+    min_liquidity: float = 1000,
+) -> list[Market]:
+    """
+    Fetch active, open markets from Polymarket sorted by volume.
+
+    Args:
+        limit: Maximum number of markets to fetch from the API.
+        min_volume: Minimum total volume (USD) to include a market.
+        min_liquidity: Minimum current liquidity (USD) to include a market.
+
+    Returns:
+        List of Market objects that pass the filters.
+    """
+    url = f"{GAMMA_API_BASE}/markets"
+    params = {
+        "active": "true",
+        "closed": "false",
+        "limit": limit,
+        "order": "volume",
+        "ascending": "false",
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        raw_markets = response.json()
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch markets: {e}")
+        return []
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.error(f"Failed to parse API response: {e}")
+        return []
+
+    markets = []
+    for raw in raw_markets:
+        market = _parse_market(raw)
+        if market is None:
+            continue
+        if not market.active:
+            continue
+        if market.volume < min_volume:
+            continue
+        if market.liquidity < min_liquidity:
+            continue
+        # Skip markets with extreme prices (already resolved or near-certain)
+        if market.yes_price < 0.03 or market.yes_price > 0.97:
+            continue
+        markets.append(market)
+
+    logger.info(f"Fetched {len(markets)} markets (from {len(raw_markets)} raw)")
+    return markets
+
+
+def get_market_by_id(market_id: str) -> Optional[Market]:
+    """Fetch a single market by its ID."""
+    url = f"{GAMMA_API_BASE}/markets/{market_id}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return _parse_market(response.json())
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch market {market_id}: {e}")
+        return None
+
+
+def format_market_for_llm(market: Market) -> str:
+    """
+    Format market data into a clean text block for the LLM prompt.
+    Includes only the fields the model needs to reason about.
+    """
+    return (
+        f"Market Question: {market.question}\n"
+        f"Current YES Price: {market.yes_price:.4f} "
+        f"(implies {market.yes_price:.1%} probability of YES)\n"
+        f"Current NO Price: {market.no_price:.4f}\n"
+        f"Total Volume Traded: ${market.volume:,.0f}\n"
+        f"Current Liquidity: ${market.liquidity:,.0f}\n"
+        f"Resolution Date: {market.end_date}\n"
+        f"Description: {market.description}"
+    )
+
+
+if __name__ == "__main__":
+    # Quick smoke test
+    logging.basicConfig(level=logging.INFO)
+    markets = get_active_markets(limit=5, min_volume=5000, min_liquidity=500)
+    for m in markets:
+        print(m)
+        print(format_market_for_llm(m))
+        print("---")
+</file>
+
+<file path="src/news.py">
+"""
+News Search Module
+Fetches recent news headlines related to a market question using DuckDuckGo.
+No API key required.
+"""
+
+import logging
+import re
+import time
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_search_keywords(question: str) -> str:
+    """
+    Extract meaningful search keywords from a prediction market question.
+    Strips common prediction-market boilerplate to get the core topic.
+    """
+    # Remove common prefixes
+    q = question.strip()
+    for prefix in ["Will ", "Is ", "Does ", "Has ", "Are ", "Can ", "Should "]:
+        if q.startswith(prefix):
+            q = q[len(prefix):]
+            break
+
+    # Remove trailing question marks and dates like "before 2027?"
+    q = re.sub(r'\?\s*$', '', q)
+    q = re.sub(r'\b(before|by|in|on|end of)\s+\d{4}\b', '', q)
+    q = re.sub(r'\bon \d{4}-\d{2}-\d{2}\b', '', q)
+
+    # Trim to first ~8 words for a focused search
+    words = q.split()
+    return ' '.join(words[:8]).strip()
+
+
+def fetch_news_context(question: str, max_results: int = 3) -> Optional[str]:
+    """
+    Search DuckDuckGo News for recent articles related to the market question.
+
+    Args:
+        question: The prediction market question text.
+        max_results: Maximum number of headlines to return.
+
+    Returns:
+        Formatted string of recent news headlines with sources, or None if search fails.
+    """
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        logger.warning("ddgs not installed — pip install ddgs")
+        return None
+
+    keywords = _extract_search_keywords(question)
+    if len(keywords) < 5:
+        logger.debug(f"Keywords too short for news search: '{keywords}'")
+        return None
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.news(keywords, max_results=max_results, safesearch="off"))
+
+        if not results:
+            logger.debug(f"No news results for: '{keywords}'")
+            return None
+
+        lines = [f"Recent news for: '{keywords}'"]
+        for r in results[:max_results]:
+            title = r.get("title", "").strip()
+            source = r.get("source", "").strip()
+            date = r.get("date", "").strip()[:10]  # Just the date part
+            body = r.get("body", "").strip()[:150]  # Truncate long bodies
+            if title:
+                lines.append(f"  • [{date}] {title} ({source})")
+                if body:
+                    lines.append(f"    {body}")
+
+        return '\n'.join(lines)
+
+    except Exception as e:
+        logger.warning(f"News search failed: {e}")
+        return None
+
+
+if __name__ == "__main__":
+    # Quick test
+    logging.basicConfig(level=logging.DEBUG)
+    result = fetch_news_context("Will the U.S. invade Iran before 2027?")
+    if result:
+        print(result)
+    else:
+        print("No news found")
+</file>
+
+<file path="src/trader.py">
+"""
+Trade Execution & Risk Management
+Position sizing (Kelly criterion), dry-run execution, trade logging,
+and portfolio summary.
+"""
+
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from src.market import Market
+from src.agent import AnalysisResult
+
+logger = logging.getLogger(__name__)
+
+DATA_DIR = Path(__file__).parent.parent / "data"
+TRADE_LOG_PATH = DATA_DIR / "trade_history.json"
+
+
+# ── Position Sizing ──────────────────────────────────────────────────────────
+
+def kelly_stake(
+    bankroll: float,
+    edge: float,
+    market_price: float,
+    direction: str,
+    fraction: float = 0.25,
+    max_pct: float = 0.10,
+) -> float:
+    """
+    Calculate position size using fractional Kelly criterion for binary markets.
+
+    In a binary prediction market:
+    - Buying YES at price p: you pay p, win (1 - p) profit if correct
+    - Buying NO at price (1-p): you pay (1-p), win p profit if correct
+
+    Kelly formula for binary bets: f* = (edge) / (price_paid_for_contract)
+    where edge = |model_prob - market_prob|
+
+    Args:
+        bankroll: Current total bankroll in USD.
+        edge: Absolute edge between model and market probability.
+        market_price: Current YES price on the market (0 to 1).
+        direction: "YES" or "NO" — which side we're betting.
+        fraction: Kelly fraction (0.25 = quarter-Kelly, much safer).
+        max_pct: Maximum percentage of bankroll per trade (hard cap).
+
+    Returns:
+        Dollar amount to stake.
+    """
+    if edge <= 0 or bankroll <= 0:
+        return 0.0
+
+    # Cost per contract depends on direction
+    if direction == "YES":
+        cost = market_price  # pay market_price, win (1 - market_price)
+    else:
+        cost = 1 - market_price  # pay (1 - market_price), win market_price
+
+    if cost <= 0 or cost >= 1:
+        return 0.0
+
+    # Kelly for binary: f* = edge / cost
+    kelly_full = edge / cost
+
+    # Apply Kelly fraction for safety
+    stake = bankroll * kelly_full * fraction
+
+    # Hard cap
+    max_stake = bankroll * max_pct
+    stake = min(stake, max_stake)
+
+    # Minimum trade size ($5 on Polymarket)
+    if stake < 5.0:
+        return 0.0
+
+    return round(stake, 2)
+
+
+# ── Trade Logging ────────────────────────────────────────────────────────────
+
+class TradeLogger:
+    """Logs every trade decision (including skips) to a JSON file."""
+
+    def __init__(self, log_path: Path = TRADE_LOG_PATH):
+        self.log_path = log_path
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.log_path.exists():
+            self.log_path.write_text("[]")
+
+    def _read_log(self) -> list[dict]:
+        try:
+            return json.loads(self.log_path.read_text())
+        except (json.JSONDecodeError, FileNotFoundError):
+            return []
+
+    def log_decision(
+        self,
+        market: Market,
+        analysis: Optional[AnalysisResult],
+        edge_info: Optional[dict],
+        stake: float,
+        action_taken: str,
+    ) -> None:
+        """
+        Append a trade decision to the log.
+
+        Args:
+            market: The market that was analyzed.
+            analysis: LLM analysis result (None if analysis failed).
+            edge_info: Edge calculation dict (None if analysis failed).
+            stake: Dollar amount staked (0 if skipped).
+            action_taken: What happened — "DRY_RUN_BET_YES", "SKIPPED", etc.
+        """
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "market_id": market.id,
+            "question": market.question,
+            "market_yes_price": market.yes_price,
+            "end_date": market.end_date,
+        }
+
+        if analysis:
+            entry.update({
+                "model_probability": analysis.estimated_probability,
+                "confidence": analysis.confidence,
+                "reasoning": analysis.reasoning,
+                "key_factors": analysis.key_factors,
+            })
+
+        if edge_info:
+            entry.update({
+                "raw_edge": edge_info["raw_edge"],
+                "abs_edge": edge_info["abs_edge"],
+                "edge_direction": edge_info["direction"],
+                "has_edge": edge_info["has_edge"],
+            })
+
+        entry.update({
+            "stake_usd": stake,
+            "action_taken": action_taken,
+        })
+
+        log = self._read_log()
+        log.append(entry)
+        self.log_path.write_text(json.dumps(log, indent=2))
+
+        logger.info(f"Logged: {action_taken} | {market.question[:50]}... | ${stake:.2f}")
+
+    def get_summary(self) -> dict:
+        """Return portfolio summary stats from the trade log."""
+        log = self._read_log()
+        if not log:
+            return {"total_decisions": 0, "message": "No trades logged yet."}
+
+        trades = [e for e in log if "BET" in e.get("action_taken", "")]
+        skips = [e for e in log if "SKIP" in e.get("action_taken", "")]
+
+        total_staked = sum(e.get("stake_usd", 0) for e in trades)
+        avg_edge = (
+            sum(e.get("abs_edge", 0) for e in trades) / len(trades)
+            if trades
+            else 0
+        )
+
+        return {
+            "total_decisions": len(log),
+            "trades_placed": len(trades),
+            "trades_skipped": len(skips),
+            "total_staked_usd": round(total_staked, 2),
+            "avg_edge": round(avg_edge, 4),
+            "first_trade": log[0]["timestamp"] if log else None,
+            "last_trade": log[-1]["timestamp"] if log else None,
+        }
+
+
+# ── Trade Execution ──────────────────────────────────────────────────────────
+
+def execute_trade(
+    market: Market,
+    direction: str,
+    stake: float,
+    dry_run: bool = True,
+) -> str:
+    """
+    Execute a trade on Polymarket (or log it in dry-run mode).
+
+    Args:
+        market: The market to trade on.
+        direction: "YES" or "NO".
+        stake: Dollar amount to stake.
+        dry_run: If True, only log what would happen. If False, place real order.
+
+    Returns:
+        String describing what happened.
+    """
+    if dry_run:
+        msg = (
+            f"[DRY RUN] Would BET {direction} on: {market.question[:60]}...\n"
+            f"  Stake: ${stake:.2f} | Price: {market.yes_price if direction == 'YES' else market.no_price:.4f}"
+        )
+        logger.info(msg)
+        return f"DRY_RUN_BET_{direction}"
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # REAL EXECUTION — Uncomment when ready to trade with real money
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #
+    # from py_clob_client.client import ClobClient
+    # from py_clob_client.clob_types import OrderArgs
+    #
+    # client = ClobClient(
+    #     host="https://clob.polymarket.com",
+    #     key=os.getenv("POLYMARKET_API_KEY"),
+    #     chain_id=137,  # Polygon mainnet
+    # )
+    #
+    # # token_id depends on YES vs NO outcome
+    # token_ids = json.loads(market.raw.get("clobTokenIds", "[]"))
+    # token_id = token_ids[0] if direction == "YES" else token_ids[1]
+    #
+    # order = client.create_order(
+    #     OrderArgs(
+    #         token_id=token_id,
+    #         price=market.yes_price if direction == "YES" else market.no_price,
+    #         size=stake / (market.yes_price if direction == "YES" else market.no_price),
+    #         side="BUY",
+    #     )
+    # )
+    # result = client.post_order(order)
+    # logger.info(f"Order placed: {result}")
+    # return f"LIVE_BET_{direction}"
+    #
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    logger.warning("Live trading is not yet implemented. Set DRY_RUN=true.")
+    return "NOT_IMPLEMENTED"
+</file>
+
+<file path=".gitignore">
+# Environment & secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Trade data (contains your decisions)
+data/
+
+# OS files
+.DS_Store
+</file>
+
+<file path="main.py">
+"""
+Polymarket Prediction Market Trading Agent
+Main entry point — orchestrates the full agent loop.
+
+Usage:
+    python main.py                    # Run continuous loop
+    python main.py --once             # Single pass, then exit
+    python main.py --once --markets 3 # Analyze 3 markets, then exit
+    python main.py --verbose          # Show full reasoning output
+    python main.py --summary          # Print portfolio summary and exit
+"""
+
+import argparse
+import logging
+import os
+import sys
+import time
+
+from dotenv import load_dotenv
+
+from src.market import get_active_markets
+from src.agent import get_backend, analyze_market, calculate_edge
+from src.trader import kelly_stake, TradeLogger, execute_trade
+
+
+def setup_logging(verbose: bool = False) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s │ %(levelname)-7s │ %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    # Quiet noisy libraries
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+
+
+def print_banner() -> None:
+    print("""
+╔══════════════════════════════════════════════════════╗
+║       Polymarket Prediction Market Agent             ║
+║       ─────────────────────────────────              ║
+║       Discover → Reason → Size → Execute             ║
+╚══════════════════════════════════════════════════════╝
+""")
+
+
+def run_cycle(
+    backend,
+    trade_logger: TradeLogger,
+    max_markets: int,
+    bankroll: float,
+    dry_run: bool,
+    verbose: bool,
+    min_volume: float,
+    min_liquidity: float,
+) -> int:
+    """
+    Run one full cycle: fetch markets, analyze, decide, execute.
+    Returns the number of trades placed (or would-be-placed in dry run).
+    """
+    logger = logging.getLogger(__name__)
+    trades_placed = 0
+
+    # ── 1. Fetch Markets ─────────────────────────────────────────────────
+    logger.info("Fetching active markets from Polymarket...")
+    markets = get_active_markets(
+        limit=max_markets * 5,  # fetch extra, since we filter aggressively
+        min_volume=min_volume,
+        min_liquidity=min_liquidity,
+    )
+
+    if not markets:
+        logger.warning("No markets found matching criteria.")
+        return 0
+
+    # Take only what we need
+    markets = markets[:max_markets]
+    logger.info(f"Analyzing {len(markets)} markets...")
+
+    # ── 2. Analyze Each Market ───────────────────────────────────────────
+    for i, market in enumerate(markets, 1):
+        print(f"\n{'─' * 60}")
+        print(f"Market {i}/{len(markets)}: {market.question[:70]}...")
+        print(f"  Market price: YES={market.yes_price:.1%} NO={market.no_price:.1%}")
+
+        # Get LLM analysis
+        analysis = analyze_market(market, backend)
+        if analysis is None:
+            print("  ⚠ Analysis failed — skipping")
+            trade_logger.log_decision(market, None, None, 0, "ANALYSIS_FAILED")
+            continue
+
+        # Calculate edge
+        edge_info = calculate_edge(market, analysis)
+        print(
+            f"  Model estimate: {edge_info['model_probability']:.1%} | "
+            f"Edge: {edge_info['raw_edge']:+.1%} ({edge_info['direction']})"
+        )
+        print(f"  Confidence: {analysis.confidence} | Action: {analysis.action}")
+
+        if verbose:
+            print(f"  Reasoning: {analysis.reasoning}")
+            print(f"  Key factors: {', '.join(analysis.key_factors)}")
+
+        # ── 3. Decide ────────────────────────────────────────────────────
+        if not edge_info["has_edge"]:
+            print(
+                f"  ✗ Edge {edge_info['abs_edge']:.1%} below threshold "
+                f"{edge_info['threshold']:.1%} — SKIP"
+            )
+            trade_logger.log_decision(market, analysis, edge_info, 0, "SKIPPED_LOW_EDGE")
+            continue
+
+        if analysis.confidence == "low":
+            print("  ✗ Low confidence — SKIP")
+            trade_logger.log_decision(market, analysis, edge_info, 0, "SKIPPED_LOW_CONFIDENCE")
+            continue
+
+        # ── 4. Size Position ─────────────────────────────────────────────
+        stake = kelly_stake(
+            bankroll=bankroll,
+            edge=edge_info["abs_edge"],
+            market_price=market.yes_price,
+            direction=edge_info["direction"],
+        )
+
+        if stake <= 0:
+            print("  ✗ Kelly sizing returned $0 — SKIP")
+            trade_logger.log_decision(market, analysis, edge_info, 0, "SKIPPED_ZERO_STAKE")
+            continue
+
+        print(f"  ✓ Stake: ${stake:.2f} | Direction: {edge_info['direction']}")
+
+        # ── 5. Execute ───────────────────────────────────────────────────
+        action = execute_trade(market, edge_info["direction"], stake, dry_run=dry_run)
+        trade_logger.log_decision(market, analysis, edge_info, stake, action)
+        trades_placed += 1
+
+    return trades_placed
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Polymarket Prediction Market Agent")
+    parser.add_argument("--once", action="store_true", help="Run a single pass then exit")
+    parser.add_argument("--markets", type=int, default=10, help="Max markets to analyze per cycle")
+    parser.add_argument("--verbose", action="store_true", help="Show full LLM reasoning")
+    parser.add_argument("--summary", action="store_true", help="Print portfolio summary and exit")
+    args = parser.parse_args()
+
+    # Load config
+    load_dotenv()
+    setup_logging(args.verbose)
+    logger = logging.getLogger(__name__)
+
+    # Print summary and exit if requested
+    if args.summary:
+        trade_logger = TradeLogger()
+        summary = trade_logger.get_summary()
+        print("\n📊 Portfolio Summary")
+        print("─" * 40)
+        for k, v in summary.items():
+            print(f"  {k}: {v}")
+        return
+
+    print_banner()
+
+    # Config from .env
+    dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+    bankroll = float(os.getenv("BANKROLL", "100"))
+    scan_interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
+    min_volume = float(os.getenv("MIN_VOLUME", "10000"))
+    min_liquidity = float(os.getenv("MIN_LIQUIDITY", "1000"))
+
+    mode_label = "🧪 DRY RUN" if dry_run else "🔴 LIVE TRADING"
+    print(f"  Mode:     {mode_label}")
+    print(f"  Bankroll: ${bankroll:.2f}")
+    print(f"  Markets:  {args.markets} per cycle")
+    print(f"  Interval: {scan_interval}s")
+
+    # Init components
+    try:
+        backend = get_backend()
+        print(f"  Backend:  {backend.name}")
+    except ValueError as e:
+        print(f"\n❌ {e}")
+        sys.exit(1)
+
+    trade_logger = TradeLogger()
+    print()
+
+    # ── Main Loop ────────────────────────────────────────────────────────
+    cycle = 0
+    while True:
+        cycle += 1
+        logger.info(f"═══ Cycle {cycle} ═══")
+
+        try:
+            trades = run_cycle(
+                backend=backend,
+                trade_logger=trade_logger,
+                max_markets=args.markets,
+                bankroll=bankroll,
+                dry_run=dry_run,
+                verbose=args.verbose,
+                min_volume=min_volume,
+                min_liquidity=min_liquidity,
+            )
+            logger.info(f"Cycle {cycle} complete — {trades} trade(s) placed")
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            logger.error(f"Cycle {cycle} failed: {e}", exc_info=True)
+
+        if args.once:
+            print("\n✅ Single pass complete. Exiting.")
+            break
+
+        logger.info(f"Sleeping {scan_interval}s until next cycle...")
+        try:
+            time.sleep(scan_interval)
+        except KeyboardInterrupt:
+            print("\n\n👋 Agent stopped. Run with --summary to see stats.")
+            break
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="requirements.txt">
+requests>=2.31.0
+python-dotenv>=1.0.0
+groq>=0.4.0
+</file>
+
+</files>

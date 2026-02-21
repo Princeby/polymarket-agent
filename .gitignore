@@ -1,0 +1,14 @@
+# Environment & secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Trade data (contains your decisions)
+data/
+
+# OS files
+.DS_Store
