@@ -42,19 +42,745 @@ The content is organized as follows:
 <directory_structure>
 prompts/
   trading_prompt.txt
+scripts/
+  com.polymarket.agent.resolve.plist
+  com.polymarket.agent.scan.plist
+  run.sh
 src/
   __init__.py
   agent.py
   market.py
   news.py
+  trader_two.py
   trader.py
 .gitignore
+backtest_2.py
+backtest.py
 main.py
+report.py
 requirements.txt
+resolve.py
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="src/trader_two.py">
+"""
+Trade Execution & Risk Management
+Position sizing (Kelly criterion), dry-run execution, trade logging,
+portfolio summary, and open position deduplication.
+"""
+
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from src.market import Market
+from src.agent import AnalysisResult
+
+logger = logging.getLogger(__name__)
+
+DATA_DIR = Path(__file__).parent.parent / "data"
+TRADE_LOG_PATH = DATA_DIR / "trade_history.json"
+
+
+# ── Position Sizing ────────────────────────────────────────────────────────────
+
+def kelly_stake(
+    bankroll: float,
+    edge: float,
+    market_price: float,
+    direction: str,
+    fraction: float = 0.25,
+    max_pct: float = 0.10,
+) -> float:
+    """
+    Calculate position size using fractional Kelly criterion for binary markets.
+
+    In a binary prediction market:
+      - Buying YES at price p: you pay p, win (1 - p) profit if correct
+      - Buying NO at price (1-p): you pay (1-p), win p profit if correct
+
+    Kelly formula for binary bets:
+        f* = edge / cost_per_contract
+
+    Args:
+        bankroll:    Current total bankroll in USD.
+        edge:        Absolute edge between model and market probability.
+        market_price: Current YES price on the market (0 to 1).
+        direction:   "YES" or "NO" — which side we're betting.
+        fraction:    Kelly fraction (0.25 = quarter-Kelly, much safer).
+        max_pct:     Maximum percentage of bankroll per trade (hard cap).
+
+    Returns:
+        Dollar amount to stake.
+    """
+    if edge <= 0 or bankroll <= 0:
+        return 0.0
+
+    cost = market_price if direction == "YES" else 1 - market_price
+    if cost <= 0 or cost >= 1:
+        return 0.0
+
+    kelly_full = edge / cost
+    stake = bankroll * kelly_full * fraction
+    stake = min(stake, bankroll * max_pct)
+
+    if stake < 5.0:  # Polymarket minimum
+        return 0.0
+
+    return round(stake, 2)
+
+
+# ── Trade Logging ──────────────────────────────────────────────────────────────
+
+class TradeLogger:
+    """Logs every trade decision (including skips) to a JSON file."""
+
+    def __init__(self, log_path: Path = TRADE_LOG_PATH):
+        self.log_path = log_path
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.log_path.exists():
+            self.log_path.write_text("[]")
+
+    def _read_log(self) -> list[dict]:
+        try:
+            return json.loads(self.log_path.read_text())
+        except (json.JSONDecodeError, FileNotFoundError):
+            return []
+
+    # ── Position Deduplication ─────────────────────────────────────────────────
+
+    def get_open_position_ids(self) -> set:
+        """
+        Return the set of market IDs where we have an active (unresolved) bet.
+
+        A position is 'open' when:
+          - An entry with action_taken containing 'BET' exists for that market, AND
+          - No entry for that market has a 'resolved_outcome' yet.
+
+        This prevents the agent from doubling into the same market across cycles.
+        """
+        log = self._read_log()
+        bet_markets: set[str] = set()
+        resolved_markets: set[str] = set()
+
+        for entry in log:
+            mid = entry.get("market_id", "")
+            if not mid:
+                continue
+            if "BET" in entry.get("action_taken", ""):
+                bet_markets.add(mid)
+            if "resolved_outcome" in entry:
+                resolved_markets.add(mid)
+
+        # Open = we bet on it, but it hasn't resolved yet
+        return bet_markets - resolved_markets
+
+    def is_open_position(self, market_id: str) -> bool:
+        """Return True if we already hold an unresolved bet on this market."""
+        return market_id in self.get_open_position_ids()
+
+    # ── Core Logging ───────────────────────────────────────────────────────────
+
+    def log_decision(
+        self,
+        market: Market,
+        analysis: Optional[AnalysisResult],
+        edge_info: Optional[dict],
+        stake: float,
+        action_taken: str,
+    ) -> None:
+        """
+        Append a trade decision to the log.
+
+        Args:
+            market:       The market that was analyzed.
+            analysis:     LLM analysis result (None if analysis failed).
+            edge_info:    Edge calculation dict (None if analysis failed).
+            stake:        Dollar amount staked (0 if skipped).
+            action_taken: What happened — "DRY_RUN_BET_YES", "SKIPPED", etc.
+        """
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "market_id": market.id,
+            "question": market.question,
+            "market_yes_price": market.yes_price,
+            "end_date": market.end_date,
+        }
+
+        if analysis:
+            entry.update({
+                "model_probability": analysis.estimated_probability,
+                "confidence": analysis.confidence,
+                "reasoning": analysis.reasoning,
+                "key_factors": analysis.key_factors,
+            })
+
+        if edge_info:
+            entry.update({
+                "raw_edge": edge_info["raw_edge"],
+                "abs_edge": edge_info["abs_edge"],
+                "edge_direction": edge_info["direction"],
+                "has_edge": edge_info["has_edge"],
+            })
+
+        entry.update({
+            "stake_usd": stake,
+            "action_taken": action_taken,
+        })
+
+        log = self._read_log()
+        log.append(entry)
+        self.log_path.write_text(json.dumps(log, indent=2))
+        logger.info(f"Logged: {action_taken} | {market.question[:50]}... | ${stake:.2f}")
+
+    def resolve_market(self, market_id: str, outcome: str) -> bool:
+        """
+        Mark a market as resolved with YES or NO outcome.
+        Updates all log entries for that market_id.
+
+        Args:
+            market_id: The Polymarket market ID.
+            outcome:   "YES" or "NO".
+
+        Returns:
+            True if any entries were updated.
+        """
+        outcome = outcome.upper()
+        if outcome not in ("YES", "NO"):
+            logger.error(f"Invalid outcome '{outcome}' — must be YES or NO")
+            return False
+
+        log = self._read_log()
+        updated = 0
+        for entry in log:
+            if entry.get("market_id") == market_id:
+                entry["resolved_outcome"] = outcome
+                entry["outcome_value"] = 1.0 if outcome == "YES" else 0.0
+                updated += 1
+
+        if updated > 0:
+            self.log_path.write_text(json.dumps(log, indent=2))
+            logger.info(f"Resolved market {market_id} as {outcome} ({updated} entries)")
+        else:
+            logger.warning(f"No entries found for market {market_id}")
+
+        return updated > 0
+
+    def get_calibration(self) -> dict:
+        """
+        Calculate Brier score and calibration metrics on resolved markets.
+
+        Brier score = mean of (forecast - outcome)^2
+          - 0.0  = perfect calibration
+          - 0.25 = coin-flip baseline (no skill)
+          - Higher = worse than random
+
+        Returns:
+            Dict with brier_score, num_resolved, calibration buckets, etc.
+        """
+        log = self._read_log()
+        resolved = [
+            e for e in log
+            if "outcome_value" in e and "model_probability" in e
+        ]
+
+        if not resolved:
+            return {
+                "num_resolved": 0,
+                "message": "No resolved markets yet. Run for 2-4 weeks, then resolve markets.",
+            }
+
+        brier_sum = sum(
+            (e["model_probability"] - e["outcome_value"]) ** 2
+            for e in resolved
+        )
+        brier_score = brier_sum / len(resolved)
+
+        buckets = {}
+        for e in resolved:
+            bucket = int(e["model_probability"] * 10) * 10
+            bucket = min(bucket, 90)
+            if bucket not in buckets:
+                buckets[bucket] = {"count": 0, "sum_forecast": 0.0, "sum_actual": 0.0}
+            buckets[bucket]["count"] += 1
+            buckets[bucket]["sum_forecast"] += e["model_probability"]
+            buckets[bucket]["sum_actual"] += e["outcome_value"]
+
+        calibration_table = {}
+        for b in sorted(buckets.keys()):
+            n = buckets[b]["count"]
+            avg_forecast = buckets[b]["sum_forecast"] / n
+            avg_actual = buckets[b]["sum_actual"] / n
+            calibration_table[f"{b}-{b+10}%"] = {
+                "count": n,
+                "avg_forecast": round(avg_forecast, 3),
+                "avg_actual": round(avg_actual, 3),
+                "gap": round(abs(avg_forecast - avg_actual), 3),
+            }
+
+        return {
+            "brier_score": round(brier_score, 4),
+            "brier_interpretation": (
+                "Excellent" if brier_score < 0.1 else
+                "Good" if brier_score < 0.2 else
+                "Baseline (no skill)" if brier_score < 0.26 else
+                "Poor — worse than random"
+            ),
+            "num_resolved": len(resolved),
+            "calibration_buckets": calibration_table,
+        }
+
+    def get_unresolved_markets(self) -> list[dict]:
+        """Return unique markets that have predictions but no resolution yet."""
+        log = self._read_log()
+        seen = set()
+        unresolved = []
+        for e in log:
+            mid = e.get("market_id", "")
+            if mid and mid not in seen and "outcome_value" not in e:
+                if "model_probability" in e:
+                    seen.add(mid)
+                    unresolved.append({
+                        "market_id": mid,
+                        "question": e.get("question", "")[:70],
+                        "model_prob": e.get("model_probability"),
+                        "end_date": e.get("end_date", ""),
+                    })
+        return unresolved
+
+    def get_summary(self) -> dict:
+        """Return portfolio summary stats from the trade log."""
+        log = self._read_log()
+        if not log:
+            return {"total_decisions": 0, "message": "No trades logged yet."}
+
+        trades = [e for e in log if "BET" in e.get("action_taken", "")]
+        skips = [e for e in log if "SKIP" in e.get("action_taken", "")]
+        resolved = [e for e in log if "outcome_value" in e]
+
+        total_staked = sum(e.get("stake_usd", 0) for e in trades)
+        avg_edge = (
+            sum(e.get("abs_edge", 0) for e in trades) / len(trades)
+            if trades else 0
+        )
+
+        summary = {
+            "total_decisions": len(log),
+            "trades_placed": len(trades),
+            "trades_skipped": len(skips),
+            "open_positions": len(self.get_open_position_ids()),
+            "total_staked_usd": round(total_staked, 2),
+            "avg_edge": round(avg_edge, 4),
+            "markets_resolved": len(set(e["market_id"] for e in resolved)),
+            "first_trade": log[0]["timestamp"] if log else None,
+            "last_trade": log[-1]["timestamp"] if log else None,
+        }
+
+        cal = self.get_calibration()
+        if cal.get("brier_score") is not None:
+            summary["brier_score"] = cal["brier_score"]
+            summary["brier_interpretation"] = cal["brier_interpretation"]
+
+        return summary
+
+
+# ── Trade Execution ────────────────────────────────────────────────────────────
+
+def execute_trade(
+    market: Market,
+    direction: str,
+    stake: float,
+    dry_run: bool = True,
+) -> str:
+    """
+    Execute a trade on Polymarket (or log it in dry-run mode).
+
+    Args:
+        market:    The market to trade on.
+        direction: "YES" or "NO".
+        stake:     Dollar amount to stake.
+        dry_run:   If True, only log what would happen. If False, place real order.
+
+    Returns:
+        String describing what happened.
+    """
+    if dry_run:
+        msg = (
+            f"[DRY RUN] Would BET {direction} on: {market.question[:60]}...\n"
+            f"  Stake: ${stake:.2f} | "
+            f"Price: {market.yes_price if direction == 'YES' else market.no_price:.4f}"
+        )
+        logger.info(msg)
+        return f"DRY_RUN_BET_{direction}"
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # REAL EXECUTION — Uncomment when ready to trade with real money
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #
+    # from py_clob_client.client import ClobClient
+    # from py_clob_client.clob_types import OrderArgs
+    #
+    # client = ClobClient(
+    #     host="https://clob.polymarket.com",
+    #     key=os.getenv("POLYMARKET_API_KEY"),
+    #     chain_id=137,  # Polygon mainnet
+    # )
+    #
+    # token_ids = json.loads(market.raw.get("clobTokenIds", "[]"))
+    # token_id = token_ids[0] if direction == "YES" else token_ids[1]
+    #
+    # order = client.create_order(
+    #     OrderArgs(
+    #         token_id=token_id,
+    #         price=market.yes_price if direction == "YES" else market.no_price,
+    #         size=stake / (market.yes_price if direction == "YES" else market.no_price),
+    #         side="BUY",
+    #     )
+    # )
+    # result = client.post_order(order)
+    # logger.info(f"Order placed: {result}")
+    # return f"LIVE_BET_{direction}"
+    #
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    logger.warning("Live trading is not yet implemented. Set DRY_RUN=true.")
+    return "NOT_IMPLEMENTED"
+</file>
+
+<file path="backtest_2.py">
+#!/usr/bin/env python3
+"""
+Stringent Categorical Backtester (Phase 1-3)
+─────────────────────────────────────────────
+Fetches large datasets (500+ markets) from Polymarket to rigorously
+validate the model's edge before live trading.
+
+Features:
+- Categorization (Politics, Weather, Crypto Token, etc.)
+- Pagination to bypass API limits
+- Simulated execution slippage penalty
+- Strict success thresholds
+
+Usage:
+    python backtest_2.py --markets 500 --slippage 0.02
+"""
+
+import argparse
+import json
+import logging
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+
+import requests
+from dotenv import load_dotenv
+
+from src.agent import get_backend, analyze_market
+from src.market import Market
+from src.trader import kelly_stake
+
+load_dotenv()
+
+# Quiet noisy libraries
+for lib in ["urllib3", "requests", "primp", "h2", "rustls", "hyper_util", "cookie_store", "ddgs"]:
+    logging.getLogger(lib).setLevel(logging.WARNING)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+
+
+@dataclass
+class StrictBacktestResult:
+    market_id: str
+    question: str
+    category: str
+    actual_outcome: str       # "YES" or "NO"
+    model_probability: float  # model's P(YES)
+    direction: str            # "YES" or "NO"
+    stake: float
+    won: bool
+    pnl: float
+
+
+def categorize(q: str) -> str:
+    """Categorize market based on question content."""
+    q = q.lower()
+    if any(w in q for w in ['bitcoin', 'btc', 'ethereum', 'eth', 'xrp', 'solana', 'crypto']):
+        return 'Crypto Price'
+    if any(w in q for w in ['fdv', 'pump.fun', 'superform', 'aztec', 'launch', 'airdrop']):
+        return 'Crypto Token'
+    if any(w in q for w in ['trump', 'pardon', 'election', 'democrat', 'republican', 'primary', 'vote', 'cabinet', 'president', 'congress', 'nato', 'israel', 'saudi', 'russia', 'ukraine']):
+        return 'Politics/Geo'
+    if any(w in q for w in ['nba', 'nfl', 'spread:', 'o/u', 'vs.', 'win on', 'beat', 'baseball', 'reds', 'braves', 'astros', 'nationals', 'texans', 'chargers', 'knicks', 'lakers', '76ers', 'raptors', 'sabres', 'warriors', 'suns']):
+        return 'Sports'
+    if any(w in q for w in ['counter-strike', 'dota', 'esports', 'bo3']):
+        return 'Esports'
+    if any(w in q for w in ['temperature', 'weather', '°f', '°c']):
+        return 'Weather'
+    if any(w in q for w in ['tweet', 'musk post', 'say "']):
+        return 'Speech/Social'
+    if any(w in q for w in ['chelsea', 'manchester', 'palmeiras', 'brugge', 'lyonnais', 'marseille', 'barcelona', 'atletico', 'villarreal', 'nice', 'bratislava', 'crystal palace', 'aston villa', 'swiatek', 'open', 'groningen']):
+        return 'Soccer/Tennis'
+    return 'Other'
+
+
+def fetch_large_dataset(target_count: int, min_volume: float = 10000, resolution_month: str = None) -> list[dict]:
+    """Paginate through Polymarket API to build a massive test set."""
+    if resolution_month:
+        logger.info(f"Fetching {target_count} resolved markets from {resolution_month} (min_vol=${min_volume:,.0f})...")
+    else:
+        logger.info(f"Fetching {target_count} resolved markets (min_vol=${min_volume:,.0f})...")
+    
+    results = []
+    limit = 100
+    offset = 0
+
+    while len(results) < target_count:
+        params = {
+            "closed": "true",
+            "limit": limit,
+            "offset": offset,
+            "order": "volume",
+            "ascending": "false",
+        }
+
+        try:
+            resp = requests.get(f"{GAMMA_API_BASE}/markets", params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            logger.error(f"API Error: {e}")
+            break
+
+        if not data:
+            break
+
+        for m in data:
+            end_date_str = m.get("endDate", "")
+            if resolution_month and not end_date_str.startswith(resolution_month):
+                continue
+                
+            prices = json.loads(m.get("outcomePrices", "[]"))
+            if len(prices) < 2:
+                continue
+
+            yes_price = float(prices[0])
+            vol = float(m.get("volume", 0))
+
+            # Must have clear outcome (price snapped to ~0 or ~1)
+            if 0.05 < yes_price < 0.95:
+                continue
+            if vol < min_volume:
+                continue
+
+            outcome = "YES" if yes_price >= 0.95 else "NO"
+            
+            results.append({
+                "id": str(m.get("id", "")),
+                "question": m.get("question", ""),
+                "description": m.get("description", "")[:500],
+                "outcome": outcome,
+                "volume": vol,
+                "category": categorize(m.get("question", "")),
+                "end_date": m.get("endDate", "")[:10]
+            })
+
+            if len(results) >= target_count:
+                break
+        
+        offset += limit
+        time.sleep(1) # Be gentle on API
+
+    logger.info(f"Successfully fetched {len(results)} valid markets.")
+    return results
+
+
+def run_stringent_backtest(market_data: dict, backend, bankroll: float, edge_threshold: float, slippage: float) -> StrictBacktestResult | None:
+    """Analyze market without news, applying a slippage penalty to the execution price."""
+    # Build market
+    market = Market(
+        id=market_data["id"],
+        question=market_data["question"],
+        description=market_data["description"],
+        yes_price=0.50,  # Base price for testing
+        no_price=0.50,
+        volume=market_data["volume"],
+        liquidity=0,
+        end_date=market_data["end_date"],
+        active=False,
+        slug="",
+    )
+
+    # Analyze WITHOUT news
+    analysis = analyze_market(market, backend, include_news=False)
+    if analysis is None:
+        return None
+
+    model_prob = analysis.estimated_probability
+    actual_outcome = market_data["outcome"]
+    
+    # ── Slippage Simulation ──
+    # If the model thinks P(YES) = 60%, but there's 2% slippage, the effective execution
+    # price we'd get isn't 50¢, it's 52¢. We have to beat *that* price to have an edge.
+    exec_price_yes = 0.50 + slippage
+    exec_price_no = 0.50 + slippage
+
+    if model_prob > exec_price_yes + edge_threshold:
+        direction = "YES"
+        edge = model_prob - exec_price_yes
+        stake_price = exec_price_yes
+    elif (1 - model_prob) > exec_price_no + edge_threshold:
+        direction = "NO"
+        edge = (1 - model_prob) - exec_price_no
+        stake_price = exec_price_no
+    else:
+        direction = "SKIP"
+        edge = 0.0
+        stake_price = 0.50
+
+    stake = 0.0
+    won = False
+    pnl = 0.0
+
+    if direction != "SKIP":
+        stake = kelly_stake(bankroll, edge, stake_price, direction, max_pct=0.10)
+        
+        if direction == "YES":
+            won = actual_outcome == "YES"
+        else:
+            won = actual_outcome == "NO"
+
+        if won:
+            pnl = stake * (1 / stake_price - 1)
+        else:
+            pnl = -stake
+
+    return StrictBacktestResult(
+        market_id=market_data["id"],
+        question=market_data["question"][:70],
+        category=market_data["category"],
+        actual_outcome=actual_outcome,
+        model_probability=model_prob,
+        direction=direction,
+        stake=stake,
+        won=won,
+        pnl=pnl
+    )
+
+
+def print_stringent_report(results: list[StrictBacktestResult], slippage: float):
+    print("\n" + "═" * 70)
+    print(f"📉 STRINGENT CATEGORICAL BACKTEST REPORT (Slippage Penalty: {slippage:.1%})")
+    print("═" * 70)
+
+    # 1. Overall Performance
+    bets = [r for r in results if r.direction != "SKIP"]
+    wins = [r for r in bets if r.won]
+    total_pnl = sum(r.pnl for r in bets)
+    total_staked = sum(r.stake for r in bets)
+    
+    brier_sum = sum((r.model_probability - (1.0 if r.actual_outcome == "YES" else 0.0)) ** 2 for r in results)
+    brier = brier_sum / len(results) if results else 0
+
+    print(f"\n[OVERALL METRICS]")
+    print(f"  Markets Analyzed:  {len(results)}")
+    print(f"  Bets Placed:       {len(bets)} / {len(results)}")
+    print(f"  Win / Loss:        {len(wins)}W / {len(bets)-len(wins)}L ({(len(wins)/len(bets)*100 if bets else 0):.1f}%)")
+    print(f"  Net P&L:           ${total_pnl:+.2f}")
+    print(f"  ROI:               {(total_pnl/total_staked*100 if total_staked else 0):+.1f}%")
+    print(f"  Overall Brier:     {brier:.4f}")
+
+    # 2. Category Breakdown
+    print("\n[CATEGORY BREAKDOWN]")
+    print(f"  {'Category':<20} {'N':>4} {'Bets':>5} {'Win%':>6} {'P&L':>8} {'Brier':>7} {'Verdict'}")
+    print("  " + "-" * 75)
+
+    cats = defaultdict(lambda: {'n': 0, 'bets': 0, 'wins': 0, 'pnl': 0.0, 'brier': 0.0})
+    for r in results:
+        c = cats[r.category]
+        c['n'] += 1
+        c['brier'] += (r.model_probability - (1.0 if r.actual_outcome == "YES" else 0.0)) ** 2
+        if r.direction != "SKIP":
+            c['bets'] += 1
+            if r.won:
+                c['wins'] += 1
+            c['pnl'] += r.pnl
+
+    for cat in sorted(cats, key=lambda x: -cats[x]['n']):
+        c = cats[cat]
+        c_brier = c['brier'] / c['n']
+        c_win_pct = (c['wins'] / c['bets'] * 100) if c['bets'] > 0 else 0
+        
+        # Strict rules for live trading
+        verdict = "❌ REJECT"
+        if c['n'] >= 10 and c['bets'] >= 5 and c_win_pct >= 60 and c['pnl'] > 0 and c_brier < 0.22:
+            verdict = "✅ APPROVED"
+        elif c['n'] < 10:
+            verdict = "🟡 NEEDS DATA"
+        elif c_win_pct >= 55 and c['pnl'] > 0:
+            verdict = "⚠️ BORDERLINE"
+
+        print(f"  {cat:<20} {c['n']:>4} {c['bets']:>5} {c_win_pct:>5.0f}% ${c['pnl']:>7.2f} {c_brier:>7.3f}   {verdict}")
+
+    print("\n" + "═" * 70)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Stringent pre-live validation")
+    parser.add_argument("--markets", type=int, default=200, help="Markets to fetch via pagination")
+    parser.add_argument("--min-volume", type=float, default=5000, help="Min volume filter")
+    parser.add_argument("--slippage", type=float, default=0.02, help="Execution slippage penalty (e.g., 0.02 = 2%)")
+    parser.add_argument("--edge-threshold", type=float, default=0.08, help="Min edge to bet")
+    parser.add_argument("--bankroll", type=float, default=1000, help="Simulated bankroll for Kelly")
+    parser.add_argument("--month", type=str, default=None, help="Filter markets by month (e.g. 2026-01)")
+    args = parser.parse_args()
+
+    backend = get_backend()
+    markets = fetch_large_dataset(
+        target_count=args.markets, 
+        min_volume=args.min_volume, 
+        resolution_month=args.month
+    )
+    
+    if not markets:
+        print("No markets found to test.")
+        return
+
+    print(f"\n🧪 Running strict backtest on {len(markets)} markets...")
+    print(f"   Model:     {backend.name}")
+    print(f"   Slippage:  {args.slippage:.1%} penalty per trade")
+    print(f"   Threshold: {args.edge_threshold:.1%} min edge over slippage\n")
+
+    results = []
+    for i, m in enumerate(markets, 1):
+        if i % 10 == 0:
+            print(f"  Progress: {i}/{len(markets)}...")
+            
+        res = run_stringent_backtest(m, backend, args.bankroll, args.edge_threshold, args.slippage)
+        if res:
+            results.append(res)
+        
+        # Avoid Groq rate limits
+        time.sleep(1.5)
+
+    print_stringent_report(results, slippage=args.slippage)
+
+
+if __name__ == "__main__":
+    main()
+</file>
 
 <file path="prompts/trading_prompt.txt">
 You are an expert prediction market analyst and superforecaster.
@@ -82,6 +808,103 @@ You MUST respond with ONLY valid JSON in this exact format:
   "action": "BET_YES | BET_NO | SKIP",
   "key_factors": ["factor1", "factor2"]
 }
+</file>
+
+<file path="scripts/com.polymarket.agent.resolve.plist">
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.polymarket.agent.resolve</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/ogbodoebuka/Desktop/Projects/polymarket-agent/scripts/run.sh</string>
+        <string>resolve</string>
+    </array>
+
+    <!-- Run once daily at 9:00 AM -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>/Users/ogbodoebuka/Desktop/Projects/polymarket-agent/data/logs/launchd_resolve.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ogbodoebuka/Desktop/Projects/polymarket-agent/data/logs/launchd_resolve.log</string>
+</dict>
+</plist>
+</file>
+
+<file path="scripts/com.polymarket.agent.scan.plist">
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.polymarket.agent.scan</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/ogbodoebuka/Desktop/Projects/polymarket-agent/scripts/run.sh</string>
+        <string>scan</string>
+    </array>
+
+    <!-- Run every 30 minutes -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- Also run immediately when loaded -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>/Users/ogbodoebuka/Desktop/Projects/polymarket-agent/data/logs/launchd_scan.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ogbodoebuka/Desktop/Projects/polymarket-agent/data/logs/launchd_scan.log</string>
+</dict>
+</plist>
+</file>
+
+<file path="scripts/run.sh">
+#!/bin/bash
+# Polymarket Agent Runner
+# Called by launchd to run the agent on a schedule.
+
+PROJ_DIR="/Users/ogbodoebuka/Desktop/Projects/polymarket-agent"
+VENV="$PROJ_DIR/venv/bin/activate"
+LOG_DIR="$PROJ_DIR/data/logs"
+
+mkdir -p "$LOG_DIR"
+
+source "$VENV"
+cd "$PROJ_DIR"
+
+TIMESTAMP=$(date +%Y-%m-%d_%H%M)
+
+case "${1:-scan}" in
+    scan)
+        echo "[$TIMESTAMP] Running market scan..." >> "$LOG_DIR/agent.log"
+        python main.py --once --markets 20 >> "$LOG_DIR/agent.log" 2>&1
+        echo "[$TIMESTAMP] Scan complete." >> "$LOG_DIR/agent.log"
+        echo "---" >> "$LOG_DIR/agent.log"
+        ;;
+    resolve)
+        echo "[$TIMESTAMP] Running auto-resolution..." >> "$LOG_DIR/resolve.log"
+        python resolve.py >> "$LOG_DIR/resolve.log" 2>&1
+        echo "[$TIMESTAMP] Resolution complete." >> "$LOG_DIR/resolve.log"
+        echo "---" >> "$LOG_DIR/resolve.log"
+        ;;
+esac
 </file>
 
 <file path="src/__init__.py">
@@ -334,7 +1157,7 @@ def get_backend() -> LLMBackend:
         )
 
 
-def analyze_market(market: Market, backend: LLMBackend) -> Optional[AnalysisResult]:
+def analyze_market(market: Market, backend: LLMBackend, include_news: bool = True) -> Optional[AnalysisResult]:
     """
     Analyze a prediction market using the LLM.
 
@@ -344,11 +1167,12 @@ def analyze_market(market: Market, backend: LLMBackend) -> Optional[AnalysisResu
     Args:
         market: The market to analyze.
         backend: Which LLM backend to use.
+        include_news: Whether to include DuckDuckGo news context (disable for backtesting).
 
     Returns:
         AnalysisResult if parsing succeeded, None otherwise.
     """
-    market_data = format_market_for_llm(market)
+    market_data = format_market_for_llm(market, include_news=include_news)
     user_prompt = USER_PROMPT_TEMPLATE.format(market_data=market_data)
 
     logger.info(f"Analyzing market: {market.question[:60]}... [{backend.name}]")
@@ -517,6 +1341,11 @@ def get_active_markets(
         # Skip markets with extreme prices (already resolved or near-certain)
         if market.yes_price < 0.03 or market.yes_price > 0.97:
             continue
+        # Skip sports spreads and O/U — model has no edge (50% win rate in backtest)
+        q = market.question.lower()
+        if q.startswith("spread:") or "o/u " in q or ": o/u " in q:
+            logger.debug(f"Skipping sports spread: {market.question[:50]}")
+            continue
         markets.append(market)
 
     logger.info(f"Fetched {len(markets)} markets (from {len(raw_markets)} raw)")
@@ -535,12 +1364,12 @@ def get_market_by_id(market_id: str) -> Optional[Market]:
         return None
 
 
-def format_market_for_llm(market: Market) -> str:
+def format_market_for_llm(market: Market, include_news: bool = True) -> str:
     """
     Format market data into a clean text block for the LLM prompt.
-    Includes only the fields the model needs to reason about.
+    Optionally includes recent news headlines for real-time context.
     """
-    return (
+    base = (
         f"Market Question: {market.question}\n"
         f"Current YES Price: {market.yes_price:.4f} "
         f"(implies {market.yes_price:.1%} probability of YES)\n"
@@ -550,6 +1379,17 @@ def format_market_for_llm(market: Market) -> str:
         f"Resolution Date: {market.end_date}\n"
         f"Description: {market.description}"
     )
+
+    if include_news:
+        try:
+            from src.news import fetch_news_context
+            news = fetch_news_context(market.question, max_results=3)
+            if news:
+                base += f"\n\n--- Recent News Context ---\n{news}"
+        except Exception as e:
+            logger.debug(f"News fetch skipped: {e}")
+
+    return base
 
 
 if __name__ == "__main__":
@@ -810,6 +1650,125 @@ class TradeLogger:
 
         logger.info(f"Logged: {action_taken} | {market.question[:50]}... | ${stake:.2f}")
 
+    def resolve_market(self, market_id: str, outcome: str) -> bool:
+        """
+        Mark a market as resolved with YES or NO outcome.
+        Updates all log entries for that market_id.
+
+        Args:
+            market_id: The Polymarket market ID.
+            outcome: "YES" or "NO".
+
+        Returns:
+            True if any entries were updated.
+        """
+        outcome = outcome.upper()
+        if outcome not in ("YES", "NO"):
+            logger.error(f"Invalid outcome '{outcome}' — must be YES or NO")
+            return False
+
+        log = self._read_log()
+        updated = 0
+        for entry in log:
+            if entry.get("market_id") == market_id:
+                entry["resolved_outcome"] = outcome
+                entry["outcome_value"] = 1.0 if outcome == "YES" else 0.0
+                updated += 1
+
+        if updated > 0:
+            self.log_path.write_text(json.dumps(log, indent=2))
+            logger.info(f"Resolved market {market_id} as {outcome} ({updated} entries)")
+        else:
+            logger.warning(f"No entries found for market {market_id}")
+
+        return updated > 0
+
+    def get_calibration(self) -> dict:
+        """
+        Calculate Brier score and calibration metrics on resolved markets.
+
+        Brier score = mean of (forecast - outcome)^2
+        - 0.0 = perfect calibration
+        - 0.25 = coin-flip baseline (no skill)
+        - Higher = worse than random
+
+        Returns:
+            Dict with brier_score, num_resolved, calibration buckets, etc.
+        """
+        log = self._read_log()
+        resolved = [
+            e for e in log
+            if "outcome_value" in e and "model_probability" in e
+        ]
+
+        if not resolved:
+            return {
+                "num_resolved": 0,
+                "message": "No resolved markets yet. Run for 2-4 weeks, then resolve markets.",
+            }
+
+        # Brier score
+        brier_sum = 0.0
+        for e in resolved:
+            forecast = e["model_probability"]
+            actual = e["outcome_value"]
+            brier_sum += (forecast - actual) ** 2
+
+        brier_score = brier_sum / len(resolved)
+
+        # Calibration buckets: group predictions into 10% bins
+        buckets = {}
+        for e in resolved:
+            bucket = int(e["model_probability"] * 10) * 10  # 0, 10, 20, ...90
+            bucket = min(bucket, 90)  # cap at 90
+            if bucket not in buckets:
+                buckets[bucket] = {"count": 0, "sum_forecast": 0.0, "sum_actual": 0.0}
+            buckets[bucket]["count"] += 1
+            buckets[bucket]["sum_forecast"] += e["model_probability"]
+            buckets[bucket]["sum_actual"] += e["outcome_value"]
+
+        calibration_table = {}
+        for b in sorted(buckets.keys()):
+            n = buckets[b]["count"]
+            avg_forecast = buckets[b]["sum_forecast"] / n
+            avg_actual = buckets[b]["sum_actual"] / n
+            calibration_table[f"{b}-{b+10}%"] = {
+                "count": n,
+                "avg_forecast": round(avg_forecast, 3),
+                "avg_actual": round(avg_actual, 3),
+                "gap": round(abs(avg_forecast - avg_actual), 3),
+            }
+
+        return {
+            "brier_score": round(brier_score, 4),
+            "brier_interpretation": (
+                "Excellent" if brier_score < 0.1 else
+                "Good" if brier_score < 0.2 else
+                "Baseline (no skill)" if brier_score < 0.26 else
+                "Poor — worse than random"
+            ),
+            "num_resolved": len(resolved),
+            "calibration_buckets": calibration_table,
+        }
+
+    def get_unresolved_markets(self) -> list[dict]:
+        """Return unique markets that have predictions but no resolution yet."""
+        log = self._read_log()
+        seen = set()
+        unresolved = []
+        for e in log:
+            mid = e.get("market_id", "")
+            if mid and mid not in seen and "outcome_value" not in e:
+                if "model_probability" in e:  # Only markets with actual predictions
+                    seen.add(mid)
+                    unresolved.append({
+                        "market_id": mid,
+                        "question": e.get("question", "")[:70],
+                        "model_prob": e.get("model_probability"),
+                        "end_date": e.get("end_date", ""),
+                    })
+        return unresolved
+
     def get_summary(self) -> dict:
         """Return portfolio summary stats from the trade log."""
         log = self._read_log()
@@ -818,6 +1777,7 @@ class TradeLogger:
 
         trades = [e for e in log if "BET" in e.get("action_taken", "")]
         skips = [e for e in log if "SKIP" in e.get("action_taken", "")]
+        resolved = [e for e in log if "outcome_value" in e]
 
         total_staked = sum(e.get("stake_usd", 0) for e in trades)
         avg_edge = (
@@ -826,15 +1786,24 @@ class TradeLogger:
             else 0
         )
 
-        return {
+        summary = {
             "total_decisions": len(log),
             "trades_placed": len(trades),
             "trades_skipped": len(skips),
             "total_staked_usd": round(total_staked, 2),
             "avg_edge": round(avg_edge, 4),
+            "markets_resolved": len(set(e["market_id"] for e in resolved)),
             "first_trade": log[0]["timestamp"] if log else None,
             "last_trade": log[-1]["timestamp"] if log else None,
         }
+
+        # Include Brier score if we have resolved markets
+        cal = self.get_calibration()
+        if cal.get("brier_score") is not None:
+            summary["brier_score"] = cal["brier_score"]
+            summary["brier_interpretation"] = cal["brier_interpretation"]
+
+        return summary
 
 
 # ── Trade Execution ──────────────────────────────────────────────────────────
@@ -917,6 +1886,370 @@ data/
 .DS_Store
 </file>
 
+<file path="backtest.py">
+#!/usr/bin/env python3
+"""
+Backtester — Test Model Against Resolved Markets
+─────────────────────────────────────────────────
+Fetches historically resolved markets from Polymarket, runs them through
+the LLM WITHOUT news context (to avoid data leakage), and measures:
+  - Brier score (calibration)
+  - Simulated P&L (profitability)
+  - Win/loss rate
+  - Calibration by probability bucket
+
+Usage:
+    python backtest.py                    # Default: 20 resolved markets
+    python backtest.py --markets 50       # Test on 50 markets
+    python backtest.py --min-volume 50000 # Only high-volume markets
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
+
+from src.agent import get_backend, analyze_market, calculate_edge
+from src.market import Market
+from src.trader import kelly_stake
+
+load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Silence noisy libs
+for lib in ["urllib3", "requests", "primp", "h2", "rustls", "hyper_util", "cookie_store", "ddgs"]:
+    logging.getLogger(lib).setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
+
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+
+
+@dataclass
+class BacktestResult:
+    market_id: str
+    question: str
+    actual_outcome: str       # "YES" or "NO"
+    model_probability: float  # model's P(YES)
+    market_price_at_close: float  # final snapped price (1.0 or 0.0)
+    edge: float
+    direction: str            # "YES" or "NO" — what model would bet
+    stake: float
+    won: bool
+    pnl: float
+
+
+def fetch_resolved_markets(limit: int = 50, min_volume: float = 50000) -> list[dict]:
+    """Fetch closed markets from Polymarket with clear outcomes."""
+    logger.info(f"Fetching resolved markets (limit={limit}, min_vol=${min_volume:,.0f})...")
+    url = f"{GAMMA_API_BASE}/markets"
+    params = {
+        "closed": "true",
+        "limit": limit * 3,  # fetch extra since we filter
+        "order": "volume",
+        "ascending": "false",
+    }
+
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        raw = resp.json()
+    except requests.RequestException as e:
+        logger.error(f"API error: {e}")
+        return []
+
+    results = []
+    for m in raw:
+        # Parse outcome from snapped prices
+        prices = json.loads(m.get("outcomePrices", "[]"))
+        if len(prices) < 2:
+            continue
+
+        yes_price = float(prices[0])
+        vol = float(m.get("volume", 0))
+
+        # Must have clear outcome (price snapped to ~0 or ~1)
+        if 0.05 < yes_price < 0.95:
+            continue
+
+        # Volume filter
+        if vol < min_volume:
+            continue
+
+        # Skip trivially short questions
+        q = m.get("question", "")
+        if len(q) < 15:
+            continue
+
+        outcome = "YES" if yes_price >= 0.95 else "NO"
+
+        results.append({
+            "id": str(m.get("id", "")),
+            "question": q,
+            "description": m.get("description", "")[:500],
+            "outcome": outcome,
+            "volume": vol,
+            "end_date": m.get("endDate", "")[:10],
+        })
+
+        if len(results) >= limit:
+            break
+
+    logger.info(f"Found {len(results)} resolved markets for backtesting")
+    return results
+
+
+def backtest_market(market_data: dict, backend, bankroll: float, edge_threshold: float) -> BacktestResult | None:
+    """
+    Run a single resolved market through the model WITHOUT news.
+    Returns BacktestResult or None if analysis fails.
+    """
+    # Build a Market object (use 0.50/0.50 as "unknown" prices to not leak info)
+    # The model should estimate probability purely from the question + description
+    market = Market(
+        id=market_data["id"],
+        question=market_data["question"],
+        description=market_data["description"],
+        yes_price=0.50,  # Hide market price — force model to reason independently
+        no_price=0.50,
+        volume=market_data["volume"],
+        liquidity=0,
+        end_date=market_data["end_date"],
+        active=False,
+        slug="",
+    )
+
+    # Analyze WITHOUT news (include_news=False to prevent data leakage)
+    analysis = analyze_market(market, backend, include_news=False)
+    if analysis is None:
+        return None
+
+    # Calculate edge vs a 50/50 baseline (since we hid the market price)
+    model_prob = analysis.estimated_probability
+    actual_outcome = market_data["outcome"]
+    actual_value = 1.0 if actual_outcome == "YES" else 0.0
+
+    # Determine what the model would bet
+    if model_prob > 0.50 + edge_threshold:
+        direction = "YES"
+        edge = model_prob - 0.50
+    elif model_prob < 0.50 - edge_threshold:
+        direction = "NO"
+        edge = 0.50 - model_prob
+    else:
+        direction = "SKIP"
+        edge = abs(model_prob - 0.50)
+
+    # Kelly sizing (vs 50/50 baseline)
+    stake = 0.0
+    if direction != "SKIP":
+        stake = kelly_stake(
+            bankroll=bankroll,
+            edge=edge,
+            market_price=0.50,
+            direction=direction,
+        )
+
+    # Did we win?
+    won = False
+    pnl = 0.0
+    if stake > 0:
+        if direction == "YES":
+            won = actual_outcome == "YES"
+        else:
+            won = actual_outcome == "NO"
+
+        if won:
+            pnl = stake * (1 / 0.50 - 1)  # payout at 50/50 odds = 2x - stake = +stake
+        else:
+            pnl = -stake
+
+    return BacktestResult(
+        market_id=market_data["id"],
+        question=market_data["question"][:70],
+        actual_outcome=actual_outcome,
+        model_probability=model_prob,
+        market_price_at_close=1.0 if actual_outcome == "YES" else 0.0,
+        edge=edge,
+        direction=direction,
+        stake=stake,
+        won=won,
+        pnl=pnl,
+    )
+
+
+def print_results(results: list[BacktestResult]):
+    """Print detailed backtest results."""
+    print()
+    print("╔══════════════════════════════════════════════════════════════════╗")
+    print("║               🧪 Backtest Results                              ║")
+    print("║               News: DISABLED (no data leakage)                 ║")
+    print("╚══════════════════════════════════════════════════════════════════╝")
+
+    # ── Per-market results ───────────────────────────────────────────────
+    bets = [r for r in results if r.direction != "SKIP"]
+    skips = [r for r in results if r.direction == "SKIP"]
+
+    print(f"\n  {'#':<4} {'Result':<8} {'Pred':>5} {'Actual':<6} {'Bet':<5} "
+          f"{'Stake':>7} {'P&L':>8} {'Question'}")
+    print(f"  {'─' * 85}")
+
+    for i, r in enumerate(results, 1):
+        if r.direction == "SKIP":
+            icon = "⏭️"
+            result_str = "skip"
+            pnl_str = "   —"
+        elif r.won:
+            icon = "✅"
+            result_str = "WIN"
+            pnl_str = f"${r.pnl:+.2f}"
+        else:
+            icon = "❌"
+            result_str = "LOSS"
+            pnl_str = f"${r.pnl:+.2f}"
+
+        print(f"  {i:<4} {icon} {result_str:<5} {r.model_probability:>4.0%}  "
+              f"{r.actual_outcome:<6} {r.direction:<5} "
+              f"${r.stake:>6.2f} {pnl_str:>8}  {r.question[:40]}")
+
+    # ── Summary stats ────────────────────────────────────────────────────
+    print(f"\n{'═' * 65}")
+
+    # Brier score on ALL predictions
+    brier_sum = sum((r.model_probability - (1.0 if r.actual_outcome == "YES" else 0.0)) ** 2
+                    for r in results)
+    brier = brier_sum / len(results)
+
+    # Win/loss on actual bets
+    wins = [r for r in bets if r.won]
+    losses = [r for r in bets if not r.won]
+    total_pnl = sum(r.pnl for r in bets)
+    total_staked = sum(r.stake for r in bets)
+    roi = (total_pnl / total_staked * 100) if total_staked > 0 else 0
+
+    print(f"  Markets tested:    {len(results)}")
+    print(f"  Bets placed:       {len(bets)} ({len(skips)} skipped)")
+    print(f"  Win / Loss:        {len(wins)}W / {len(losses)}L "
+          f"({len(wins)/len(bets)*100:.0f}% win rate)" if bets else "")
+    print(f"  Total staked:      ${total_staked:.2f}")
+    print(f"  Net P&L:           ${total_pnl:+.2f}")
+    print(f"  ROI:               {roi:+.1f}%")
+
+    print(f"\n  Brier Score:       {brier:.4f}")
+    if brier < 0.15:
+        print(f"  Assessment:        🏆 Excellent — model has real predictive power")
+    elif brier < 0.25:
+        print(f"  Assessment:        👍 Good — model adds signal over 50/50 baseline")
+    elif brier < 0.30:
+        print(f"  Assessment:        ⚠️  Marginal — close to no-skill baseline")
+    else:
+        print(f"  Assessment:        🚨 Poor — model is not well-calibrated")
+
+    # ── Calibration buckets ──────────────────────────────────────────────
+    print(f"\n  Calibration by prediction bucket:")
+    print(f"  {'Bucket':<12} {'Count':<7} {'Model Avg':<11} {'Actual Rate':<12} {'Gap'}")
+    print(f"  {'─'*50}")
+
+    from collections import defaultdict
+    buckets = defaultdict(lambda: {"n": 0, "sum_p": 0.0, "sum_y": 0.0})
+    for r in results:
+        b = int(r.model_probability * 10) * 10
+        b = min(b, 90)
+        buckets[b]["n"] += 1
+        buckets[b]["sum_p"] += r.model_probability
+        buckets[b]["sum_y"] += 1.0 if r.actual_outcome == "YES" else 0.0
+
+    for b in sorted(buckets):
+        d = buckets[b]
+        avg_p = d["sum_p"] / d["n"]
+        avg_y = d["sum_y"] / d["n"]
+        gap = abs(avg_p - avg_y)
+        gap_bar = "●" * min(int(gap * 20), 10)
+        print(f"  {b}-{b+10}%      {d['n']:<7} {avg_p:<11.1%} {avg_y:<12.1%} {gap_bar}")
+
+    # ── Verdict ──────────────────────────────────────────────────────────
+    print(f"\n{'─' * 65}")
+    if brier < 0.20 and roi > 0:
+        print("  ✅ GREEN LIGHT — Model is calibrated AND profitable in backtest.")
+        print("     Ready for cautious dry-run on live markets.")
+    elif brier < 0.25:
+        print("  🟡 YELLOW — Model shows some skill but needs more data.")
+        print("     Continue dry-run and tune prompts.")
+    else:
+        print("  🔴 RED — Model needs significant improvement before live trading.")
+        print("     Try a stronger model or better prompting strategy.")
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Backtest model against resolved Polymarket data")
+    parser.add_argument("--markets", type=int, default=20, help="Number of resolved markets to test")
+    parser.add_argument("--min-volume", type=float, default=50000, help="Minimum volume filter")
+    parser.add_argument("--edge-threshold", type=float, default=0.08,
+                        help="Min edge to place bet (default 8%%)")
+    parser.add_argument("--bankroll", type=float, default=100, help="Simulated bankroll")
+    args = parser.parse_args()
+
+    # Init LLM backend
+    try:
+        backend = get_backend()
+        logger.info(f"Using backend: {backend.name}")
+    except ValueError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+    # Fetch resolved markets
+    resolved = fetch_resolved_markets(limit=args.markets, min_volume=args.min_volume)
+    if not resolved:
+        print("No resolved markets found. Try lowering --min-volume.")
+        return
+
+    # Run backtest
+    print(f"\n🧪 Backtesting {len(resolved)} markets (news DISABLED)...")
+    print(f"   Backend: {backend.name}")
+    print(f"   Edge threshold: {args.edge_threshold:.0%}")
+    print(f"   Bankroll: ${args.bankroll:.0f}")
+
+    results = []
+    for i, m in enumerate(resolved, 1):
+        logger.info(f"[{i}/{len(resolved)}] {m['question'][:60]}...")
+        result = backtest_market(m, backend, args.bankroll, args.edge_threshold)
+        if result:
+            results.append(result)
+            icon = "✅" if result.won else ("❌" if result.direction != "SKIP" else "⏭️")
+            logger.info(f"  {icon} Pred: {result.model_probability:.0%} | "
+                        f"Actual: {result.actual_outcome} | Bet: {result.direction}")
+        else:
+            logger.warning(f"  ⚠ Analysis failed — skipping")
+
+    if not results:
+        print("All analyses failed. Check your API key.")
+        return
+
+    # Save backtest results
+    output_path = Path(__file__).parent / "data" / "backtest_results.json"
+    output_path.write_text(json.dumps([asdict(r) for r in results], indent=2))
+    logger.info(f"Results saved to {output_path}")
+
+    # Print report
+    print_results(results)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
 <file path="main.py">
 """
 Polymarket Prediction Market Trading Agent
@@ -940,7 +2273,7 @@ from dotenv import load_dotenv
 
 from src.market import get_active_markets
 from src.agent import get_backend, analyze_market, calculate_edge
-from src.trader import kelly_stake, TradeLogger, execute_trade
+from src.trader_two import kelly_stake, TradeLogger, execute_trade
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -950,9 +2283,9 @@ def setup_logging(verbose: bool = False) -> None:
         format="%(asctime)s │ %(levelname)-7s │ %(message)s",
         datefmt="%H:%M:%S",
     )
-    # Quiet noisy libraries
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("requests").setLevel(logging.WARNING)
+    for lib in ["urllib3", "requests", "primp", "h2", "rustls",
+                "hyper_util", "cookie_store", "ddgs"]:
+        logging.getLogger(lib).setLevel(logging.WARNING)
 
 
 def print_banner() -> None:
@@ -977,15 +2310,19 @@ def run_cycle(
 ) -> int:
     """
     Run one full cycle: fetch markets, analyze, decide, execute.
+
+    Open positions are loaded once per cycle and used to skip markets
+    where we already hold an unresolved bet, preventing double-entry.
+
     Returns the number of trades placed (or would-be-placed in dry run).
     """
     logger = logging.getLogger(__name__)
     trades_placed = 0
 
-    # ── 1. Fetch Markets ─────────────────────────────────────────────────
+    # ── 1. Fetch Markets ──────────────────────────────────────────────────────
     logger.info("Fetching active markets from Polymarket...")
     markets = get_active_markets(
-        limit=max_markets * 5,  # fetch extra, since we filter aggressively
+        limit=max_markets * 5,  # fetch extra since we filter aggressively
         min_volume=min_volume,
         min_liquidity=min_liquidity,
     )
@@ -994,15 +2331,30 @@ def run_cycle(
         logger.warning("No markets found matching criteria.")
         return 0
 
-    # Take only what we need
     markets = markets[:max_markets]
-    logger.info(f"Analyzing {len(markets)} markets...")
 
-    # ── 2. Analyze Each Market ───────────────────────────────────────────
+    # ── 2. Load open positions once (avoid repeated disk reads per market) ────
+    open_positions: set[str] = trade_logger.get_open_position_ids()
+    if open_positions:
+        logger.info(
+            f"Skipping {len(open_positions)} market(s) with open positions: "
+            + ", ".join(list(open_positions)[:5])
+            + (" ..." if len(open_positions) > 5 else "")
+        )
+
+    logger.info(f"Analyzing up to {len(markets)} markets...")
+
+    # ── 3. Analyze Each Market ────────────────────────────────────────────────
     for i, market in enumerate(markets, 1):
         print(f"\n{'─' * 60}")
         print(f"Market {i}/{len(markets)}: {market.question[:70]}...")
-        print(f"  Market price: YES={market.yes_price:.1%} NO={market.no_price:.1%}")
+        print(f"  Market price: YES={market.yes_price:.1%}  NO={market.no_price:.1%}")
+
+        # ── Deduplication check ───────────────────────────────────────────────
+        if market.id in open_positions:
+            print(f"  ⏭  Already holding an open position — SKIP")
+            logger.debug(f"Skipping open position: {market.id}")
+            continue
 
         # Get LLM analysis
         analysis = analyze_market(market, backend)
@@ -1023,7 +2375,7 @@ def run_cycle(
             print(f"  Reasoning: {analysis.reasoning}")
             print(f"  Key factors: {', '.join(analysis.key_factors)}")
 
-        # ── 3. Decide ────────────────────────────────────────────────────
+        # ── 4. Decide ─────────────────────────────────────────────────────────
         if not edge_info["has_edge"]:
             print(
                 f"  ✗ Edge {edge_info['abs_edge']:.1%} below threshold "
@@ -1037,7 +2389,7 @@ def run_cycle(
             trade_logger.log_decision(market, analysis, edge_info, 0, "SKIPPED_LOW_CONFIDENCE")
             continue
 
-        # ── 4. Size Position ─────────────────────────────────────────────
+        # ── 5. Size Position ──────────────────────────────────────────────────
         stake = kelly_stake(
             bankroll=bankroll,
             edge=edge_info["abs_edge"],
@@ -1052,9 +2404,15 @@ def run_cycle(
 
         print(f"  ✓ Stake: ${stake:.2f} | Direction: {edge_info['direction']}")
 
-        # ── 5. Execute ───────────────────────────────────────────────────
+        # ── 6. Execute ────────────────────────────────────────────────────────
         action = execute_trade(market, edge_info["direction"], stake, dry_run=dry_run)
         trade_logger.log_decision(market, analysis, edge_info, stake, action)
+
+        # Add to local open_positions set so later markets in the same cycle
+        # also reflect this new bet (guards against the same market appearing
+        # twice in a single fetch batch, which is unlikely but possible).
+        open_positions.add(market.id)
+
         trades_placed += 1
 
     return trades_placed
@@ -1066,14 +2424,73 @@ def main() -> None:
     parser.add_argument("--markets", type=int, default=10, help="Max markets to analyze per cycle")
     parser.add_argument("--verbose", action="store_true", help="Show full LLM reasoning")
     parser.add_argument("--summary", action="store_true", help="Print portfolio summary and exit")
+    parser.add_argument("--calibration", action="store_true", help="Show Brier score and calibration report")
+    parser.add_argument("--unresolved", action="store_true", help="List markets awaiting resolution")
+    parser.add_argument(
+        "--resolve", nargs=2, metavar=("MARKET_ID", "OUTCOME"),
+        help="Resolve a market: --resolve 1234567 YES"
+    )
     args = parser.parse_args()
 
-    # Load config
     load_dotenv()
     setup_logging(args.verbose)
     logger = logging.getLogger(__name__)
 
-    # Print summary and exit if requested
+    # ── Resolve a market ───────────────────────────────────────────────────────
+    if args.resolve:
+        trade_logger = TradeLogger()
+        market_id, outcome = args.resolve
+        success = trade_logger.resolve_market(market_id, outcome)
+        if success:
+            print(f"✅ Market {market_id} resolved as {outcome.upper()}")
+        else:
+            print(f"❌ No entries found for market ID {market_id}")
+        return
+
+    # ── Show unresolved markets ────────────────────────────────────────────────
+    if args.unresolved:
+        trade_logger = TradeLogger()
+        unresolved = trade_logger.get_unresolved_markets()
+        if not unresolved:
+            print("No unresolved markets with predictions.")
+            return
+        print(f"\n📋 Unresolved Markets ({len(unresolved)})")
+        print("─" * 80)
+        for m in unresolved:
+            print(
+                f"  ID: {m['market_id']} | Prob: {m['model_prob']:.1%} | "
+                f"Ends: {m['end_date']}"
+            )
+            print(f"  {m['question']}")
+        print(f"\nResolve with: python main.py --resolve <ID> YES|NO")
+        return
+
+    # ── Show calibration report ────────────────────────────────────────────────
+    if args.calibration:
+        trade_logger = TradeLogger()
+        cal = trade_logger.get_calibration()
+        print("\n📐 Calibration Report")
+        print("─" * 50)
+        if cal.get("num_resolved", 0) == 0:
+            print(f"  {cal.get('message', 'No data')}")
+            unresolved = trade_logger.get_unresolved_markets()
+            if unresolved:
+                print(f"\n  You have {len(unresolved)} markets awaiting resolution.")
+                print(f"  Run: python main.py --unresolved")
+            return
+        print(f"  Brier Score: {cal['brier_score']:.4f} ({cal['brier_interpretation']})")
+        print(f"  Markets Scored: {cal['num_resolved']}")
+        print(f"\n  Calibration by bucket:")
+        print(f"  {'Bucket':<12} {'Count':<7} {'Avg Forecast':<14} {'Avg Actual':<12} {'Gap':<6}")
+        print(f"  {'─'*51}")
+        for bucket, data in cal.get("calibration_buckets", {}).items():
+            print(
+                f"  {bucket:<12} {data['count']:<7} {data['avg_forecast']:<14.3f} "
+                f"{data['avg_actual']:<12.3f} {data['gap']:<6.3f}"
+            )
+        return
+
+    # ── Portfolio summary ──────────────────────────────────────────────────────
     if args.summary:
         trade_logger = TradeLogger()
         summary = trade_logger.get_summary()
@@ -1085,7 +2502,6 @@ def main() -> None:
 
     print_banner()
 
-    # Config from .env
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     bankroll = float(os.getenv("BANKROLL", "100"))
     scan_interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))
@@ -1098,7 +2514,6 @@ def main() -> None:
     print(f"  Markets:  {args.markets} per cycle")
     print(f"  Interval: {scan_interval}s")
 
-    # Init components
     try:
         backend = get_backend()
         print(f"  Backend:  {backend.name}")
@@ -1107,9 +2522,15 @@ def main() -> None:
         sys.exit(1)
 
     trade_logger = TradeLogger()
+
+    # Show open positions count at startup
+    open_count = len(trade_logger.get_open_position_ids())
+    if open_count:
+        print(f"  Open positions: {open_count} (will be skipped each cycle)")
+
     print()
 
-    # ── Main Loop ────────────────────────────────────────────────────────
+    # ── Main Loop ──────────────────────────────────────────────────────────────
     cycle = 0
     while True:
         cycle += 1
@@ -1127,6 +2548,7 @@ def main() -> None:
                 min_liquidity=min_liquidity,
             )
             logger.info(f"Cycle {cycle} complete — {trades} trade(s) placed")
+
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -1148,10 +2570,451 @@ if __name__ == "__main__":
     main()
 </file>
 
+<file path="report.py">
+#!/usr/bin/env python3
+"""
+Weekly Performance Report
+─────────────────────────
+Breaks down agent performance by week: bets placed, stakes,
+model accuracy, P&L simulation, and trend analysis.
+
+Usage:
+    python report.py            # Full weekly breakdown
+    python report.py --weeks 4  # Last 4 weeks only
+"""
+
+import argparse
+import json
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATA_DIR = Path(__file__).parent / "data"
+TRADE_LOG = DATA_DIR / "trade_history.json"
+
+
+def load_log() -> list[dict]:
+    try:
+        return json.loads(TRADE_LOG.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def week_key(timestamp_str: str) -> str:
+    """Convert an ISO timestamp to a 'YYYY-WXX' week label."""
+    dt = datetime.fromisoformat(timestamp_str)
+    year, week, _ = dt.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def week_start_date(week_str: str) -> str:
+    """Convert 'YYYY-WXX' back to the Monday date for display."""
+    year, w = week_str.split("-W")
+    dt = datetime.strptime(f"{year} {w} 1", "%G %V %u")
+    return dt.strftime("%b %d")
+
+
+def compute_weekly_stats(log: list[dict]) -> dict:
+    """Group trade log entries by week and compute stats."""
+    weeks = defaultdict(lambda: {
+        "decisions": 0,
+        "bets": [],
+        "skips": 0,
+        "failures": 0,
+        "total_stake": 0.0,
+        "edges": [],
+        "probabilities": [],
+        "resolved": [],
+        "directions": {"YES": 0, "NO": 0},
+    })
+
+    for entry in log:
+        ts = entry.get("timestamp", "")
+        if not ts:
+            continue
+        wk = week_key(ts)
+        w = weeks[wk]
+        w["decisions"] += 1
+
+        action = entry.get("action_taken", "")
+        stake = entry.get("stake_usd", 0)
+
+        if "BET" in action:
+            w["bets"].append(entry)
+            w["total_stake"] += stake
+            direction = entry.get("edge_direction", "")
+            if direction in w["directions"]:
+                w["directions"][direction] += 1
+            if "abs_edge" in entry:
+                w["edges"].append(entry["abs_edge"])
+            if "model_probability" in entry:
+                w["probabilities"].append(entry["model_probability"])
+        elif "SKIP" in action:
+            w["skips"] += 1
+        elif "FAIL" in action:
+            w["failures"] += 1
+
+        # Track resolved outcomes
+        if "outcome_value" in entry and "model_probability" in entry:
+            w["resolved"].append({
+                "forecast": entry["model_probability"],
+                "actual": entry["outcome_value"],
+                "stake": stake,
+                "direction": entry.get("edge_direction", ""),
+                "market_price": entry.get("market_yes_price", 0.5),
+            })
+
+    return dict(sorted(weeks.items()))
+
+
+def simulate_pnl(resolved: list[dict]) -> dict:
+    """
+    Simulate P&L on resolved bets.
+    YES bet wins if outcome=1, NO bet wins if outcome=0.
+    Payout is (1/price_paid) * stake if win, lose stake if loss.
+    """
+    if not resolved:
+        return {"wins": 0, "losses": 0, "pnl": 0.0, "roi": 0.0}
+
+    wins = losses = 0
+    total_pnl = 0.0
+    total_staked = 0.0
+
+    for r in resolved:
+        stake = r["stake"]
+        direction = r["direction"]
+        actual = r["actual"]
+        market_price = r["market_price"]
+
+        if stake <= 0:
+            continue
+
+        total_staked += stake
+
+        if direction == "YES":
+            cost = market_price
+            won = actual == 1.0
+        else:
+            cost = 1 - market_price
+            won = actual == 0.0
+
+        if won:
+            profit = stake * (1 / cost - 1)  # payout minus cost
+            total_pnl += profit
+            wins += 1
+        else:
+            total_pnl -= stake
+            losses += 1
+
+    roi = (total_pnl / total_staked * 100) if total_staked > 0 else 0
+    return {"wins": wins, "losses": losses, "pnl": round(total_pnl, 2), "roi": round(roi, 1)}
+
+
+def brier_score(resolved: list[dict]) -> float | None:
+    if not resolved:
+        return None
+    total = sum((r["forecast"] - r["actual"]) ** 2 for r in resolved)
+    return round(total / len(resolved), 4)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Weekly performance report")
+    parser.add_argument("--weeks", type=int, default=0, help="Show only last N weeks (0=all)")
+    args = parser.parse_args()
+
+    log = load_log()
+    if not log:
+        print("No trade history found. Run the agent first!")
+        return
+
+    weekly = compute_weekly_stats(log)
+
+    if args.weeks > 0:
+        keys = list(weekly.keys())[-args.weeks:]
+        weekly = {k: weekly[k] for k in keys}
+
+    # ── Header ───────────────────────────────────────────────────────────
+    print()
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║              📊 Weekly Performance Report                   ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+
+    # ── Weekly Table ─────────────────────────────────────────────────────
+    print(f"\n  {'Week':<10} {'Start':<8} {'Bets':<6} {'Skip':<6} {'Staked':>8} "
+          f"{'Avg Edge':>9} {'YES/NO':<8} {'Brier':>7} {'P&L':>8}")
+    print(f"  {'─'*72}")
+
+    totals = {"bets": 0, "skips": 0, "stake": 0.0, "edges": [], "resolved": [], "decisions": 0}
+
+    for wk, stats in weekly.items():
+        n_bets = len(stats["bets"])
+        avg_edge = sum(stats["edges"]) / len(stats["edges"]) if stats["edges"] else 0
+        brier = brier_score(stats["resolved"])
+        pnl_data = simulate_pnl(stats["resolved"])
+        yes_no = f"{stats['directions']['YES']}/{stats['directions']['NO']}"
+        start = week_start_date(wk)
+
+        brier_str = f"{brier:.3f}" if brier is not None else "  —"
+        pnl_str = f"${pnl_data['pnl']:+.2f}" if stats["resolved"] else "  —"
+
+        print(f"  {wk:<10} {start:<8} {n_bets:<6} {stats['skips']:<6} "
+              f"${stats['total_stake']:>7.2f} {avg_edge:>8.1%} {yes_no:<8} "
+              f"{brier_str:>7} {pnl_str:>8}")
+
+        totals["bets"] += n_bets
+        totals["skips"] += stats["skips"]
+        totals["stake"] += stats["total_stake"]
+        totals["edges"].extend(stats["edges"])
+        totals["resolved"].extend(stats["resolved"])
+        totals["decisions"] += stats["decisions"]
+
+    # ── Totals ───────────────────────────────────────────────────────────
+    print(f"  {'─'*72}")
+    total_avg_edge = sum(totals["edges"]) / len(totals["edges"]) if totals["edges"] else 0
+    total_brier = brier_score(totals["resolved"])
+    total_pnl = simulate_pnl(totals["resolved"])
+    brier_str = f"{total_brier:.3f}" if total_brier is not None else "  —"
+    pnl_str = f"${total_pnl['pnl']:+.2f}" if totals["resolved"] else "  —"
+
+    print(f"  {'TOTAL':<10} {'':8} {totals['bets']:<6} {totals['skips']:<6} "
+          f"${totals['stake']:>7.2f} {total_avg_edge:>8.1%} {'':8} "
+          f"{brier_str:>7} {pnl_str:>8}")
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    print(f"\n{'─'*64}")
+    print(f"  Total decisions:  {totals['decisions']}")
+    print(f"  Total bets:       {totals['bets']}")
+    print(f"  Total staked:     ${totals['stake']:.2f}")
+    print(f"  Avg edge/bet:     {total_avg_edge:.1%}")
+
+    if totals["resolved"]:
+        print(f"\n  ── Resolved Bets ──")
+        print(f"  Win/Loss:         {total_pnl['wins']}W / {total_pnl['losses']}L")
+        print(f"  Net P&L:          ${total_pnl['pnl']:+.2f}")
+        print(f"  ROI:              {total_pnl['roi']:+.1f}%")
+        print(f"  Brier Score:      {total_brier:.4f}")
+
+        if total_brier < 0.10:
+            print(f"  Verdict:          🏆 Excellent — beating the market")
+        elif total_brier < 0.20:
+            print(f"  Verdict:          👍 Good signal — consider live trading")
+        elif total_brier < 0.26:
+            print(f"  Verdict:          ⚠️  Baseline — no better than market")
+        else:
+            print(f"  Verdict:          🚨 Poor — needs rework")
+    else:
+        print(f"\n  ⏳ No resolved bets yet. Markets need to expire first.")
+        print(f"     Run: python resolve.py")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
 <file path="requirements.txt">
 requests>=2.31.0
 python-dotenv>=1.0.0
 groq>=0.4.0
+ddgs>=7.0.0
+</file>
+
+<file path="resolve.py">
+#!/usr/bin/env python3
+"""
+Auto-resolution & Calibration Script
+─────────────────────────────────────
+Checks Polymarket for resolved outcomes, updates the trade log,
+and prints your Brier score calibration report.
+
+Usage:
+    python resolve.py              # Auto-resolve + show calibration
+    python resolve.py --dry-run    # Show what would be resolved without writing
+"""
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
+
+from src.trader import TradeLogger
+
+load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+
+
+def check_resolution(market_id: str) -> dict:
+    """
+    Check a market's resolution status on Polymarket.
+
+    Returns dict with:
+        resolved: bool
+        outcome: "YES" | "NO" | None
+        closed: bool
+        prices: current prices
+    """
+    url = f"{GAMMA_API_BASE}/markets/{market_id}"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        closed = data.get("closed", False)
+        active = data.get("active", True)
+        resolution = data.get("resolution", None)
+
+        # Parse outcome prices
+        prices = json.loads(data.get("outcomePrices", "[]"))
+        yes_price = float(prices[0]) if len(prices) > 0 else 0.5
+        no_price = float(prices[1]) if len(prices) > 1 else 0.5
+
+        # Determine outcome
+        outcome = None
+        is_resolved = False
+
+        if resolution:
+            # Explicit resolution field
+            is_resolved = True
+            outcome = resolution.upper() if resolution.lower() in ("yes", "no") else None
+        elif closed and not active:
+            # Market closed — check prices to infer outcome
+            # Resolved markets typically snap to 1.00/0.00
+            if yes_price >= 0.95:
+                is_resolved = True
+                outcome = "YES"
+            elif no_price >= 0.95:
+                is_resolved = True
+                outcome = "NO"
+
+        return {
+            "resolved": is_resolved,
+            "outcome": outcome,
+            "closed": closed,
+            "active": active,
+            "yes_price": yes_price,
+            "question": data.get("question", "")[:70],
+        }
+    except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"  Failed to check market {market_id}: {e}")
+        return {"resolved": False, "outcome": None, "closed": False, "active": True}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Auto-resolve markets & check calibration")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would be resolved without writing changes")
+    args = parser.parse_args()
+
+    trade_logger = TradeLogger()
+
+    # ── Step 1: Find unresolved markets ──────────────────────────────────
+    unresolved = trade_logger.get_unresolved_markets()
+    if not unresolved:
+        print("No unresolved markets to check.")
+    else:
+        print(f"\n🔍 Checking {len(unresolved)} unresolved markets against Polymarket...\n")
+
+        resolved_count = 0
+        still_open = 0
+
+        for m in unresolved:
+            mid = m["market_id"]
+            status = check_resolution(mid)
+
+            if status["resolved"] and status["outcome"]:
+                resolved_count += 1
+                symbol = "✅" if status["outcome"] == "YES" else "❌"
+                print(f"  {symbol} [{status['outcome']}] {status['question']}")
+                print(f"     Model predicted: {m['model_prob']:.1%} | Market ID: {mid}")
+
+                if not args.dry_run:
+                    trade_logger.resolve_market(mid, status["outcome"])
+            elif status["closed"]:
+                print(f"  🔒 Closed but unclear outcome: {status['question']}")
+                still_open += 1
+            else:
+                still_open += 1
+
+        print(f"\n  Resolved: {resolved_count} | Still open: {still_open}")
+        if args.dry_run and resolved_count > 0:
+            print("  (Dry run — no changes written. Remove --dry-run to save.)")
+
+    # ── Step 2: Show calibration report ──────────────────────────────────
+    cal = trade_logger.get_calibration()
+
+    print("\n" + "═" * 55)
+    print("📐 Calibration Report")
+    print("═" * 55)
+
+    if cal.get("num_resolved", 0) == 0:
+        print(f"\n  {cal.get('message', 'No resolved data yet.')}")
+        print("\n  💡 Tip: Markets need to expire and resolve before")
+        print("     calibration can be calculated. Keep running the agent!")
+        return
+
+    brier = cal["brier_score"]
+    interp = cal["brier_interpretation"]
+
+    # Visual Brier score bar
+    bar_len = 30
+    pos = min(int(brier / 0.5 * bar_len), bar_len)
+    bar = "█" * pos + "░" * (bar_len - pos)
+    print(f"\n  Brier Score: {brier:.4f}  [{bar}]")
+    print(f"  Assessment:  {interp}")
+    print(f"  Markets:     {cal['num_resolved']}")
+
+    print(f"\n  {'Bucket':<12} {'Count':<7} {'Forecast':<10} {'Actual':<10} {'Gap':<6}")
+    print(f"  {'─' * 45}")
+    for bucket, data in cal.get("calibration_buckets", {}).items():
+        gap_bar = "●" * min(int(data["gap"] * 20), 10)
+        print(f"  {bucket:<12} {data['count']:<7} {data['avg_forecast']:<10.1%} "
+              f"{data['avg_actual']:<10.1%} {gap_bar}")
+
+    # ── Step 3: Verdict ──────────────────────────────────────────────────
+    print(f"\n{'─' * 55}")
+    if brier < 0.10:
+        print("  🏆 EXCELLENT — Your model significantly beats the market.")
+        print("  ✅ GREEN LIGHT for cautious live trading.")
+    elif brier < 0.20:
+        print("  👍 GOOD — Your model adds meaningful signal.")
+        print("  🟡 Consider live trading with small stakes.")
+    elif brier < 0.26:
+        print("  ⚠️  BASELINE — Model is no better than the market price.")
+        print("  🔴 Do NOT go live. Tune prompts or try a stronger model.")
+    else:
+        print("  🚨 POOR — Model is worse than random guessing.")
+        print("  🔴 Significant rework needed before any live trading.")
+
+    # ── Step 4: Portfolio summary ────────────────────────────────────────
+    summary = trade_logger.get_summary()
+    print(f"\n{'─' * 55}")
+    print("📊 Portfolio Summary")
+    print(f"  Decisions: {summary['total_decisions']} | "
+          f"Trades: {summary['trades_placed']} | "
+          f"Staked: ${summary['total_staked_usd']:.2f}")
+    print(f"  Avg Edge: {summary['avg_edge']:.1%} | "
+          f"Resolved: {summary.get('markets_resolved', 0)}")
+    print()
+
+
+if __name__ == "__main__":
+    main()
 </file>
 
 </files>
