@@ -3,16 +3,22 @@
 Backtester — Test Model Against Resolved Markets
 ─────────────────────────────────────────────────
 Fetches historically resolved markets from Polymarket, runs them through
-the LLM WITHOUT news context (to avoid data leakage), and measures:
+the LLM and measures:
   - Brier score (calibration)
   - Simulated P&L (profitability)
   - Win/loss rate
   - Calibration by probability bucket
 
+News context is disabled by default (avoids data leakage on old markets).
+For recently resolved markets (--days 7), enable news with --news to get
+a realistic picture of live model performance.
+
 Usage:
-    python backtest.py                    # Default: 20 resolved markets
-    python backtest.py --markets 50       # Test on 50 markets
-    python backtest.py --min-volume 50000 # Only high-volume markets
+    python backtest.py                          # Default: 20 markets, no news
+    python backtest.py --markets 50             # Test on 50 markets
+    python backtest.py --news --days 7          # Recent markets WITH news (live sim)
+    python backtest.py --news --days 3 --markets 30
+    python backtest.py --min-volume 50000       # Only high-volume markets
 """
 
 import argparse
@@ -21,7 +27,9 @@ import logging
 import os
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -51,23 +59,48 @@ GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 class BacktestResult:
     market_id: str
     question: str
-    actual_outcome: str       # "YES" or "NO"
-    model_probability: float  # model's P(YES)
-    market_price_at_close: float  # final snapped price (1.0 or 0.0)
+    actual_outcome: str          # "YES" or "NO"
+    model_probability: float     # model's P(YES)
+    market_price_at_close: float # final snapped price (1.0 or 0.0)
     edge: float
-    direction: str            # "YES" or "NO" — what model would bet
+    direction: str               # "YES" or "NO" — what model would bet
     stake: float
     won: bool
     pnl: float
+    end_date: str
+    news_used: bool
 
 
-def fetch_resolved_markets(limit: int = 50, min_volume: float = 50000) -> list[dict]:
-    """Fetch closed markets from Polymarket with clear outcomes."""
-    logger.info(f"Fetching resolved markets (limit={limit}, min_vol=${min_volume:,.0f})...")
+def fetch_resolved_markets(
+    limit: int = 50,
+    min_volume: float = 50000,
+    max_days_old: int = None,  # None = no recency filter
+) -> list[dict]:
+    """
+    Fetch closed markets from Polymarket with clear outcomes.
+
+    Args:
+        limit:        Max markets to return.
+        min_volume:   Min total volume in USD.
+        max_days_old: If set, only return markets resolved within this many days.
+                      Use with --news to avoid data leakage on old markets.
+    """
+    recency_label = f"last {max_days_old}d" if max_days_old else "all time"
+    logger.info(
+        f"Fetching resolved markets "
+        f"(limit={limit}, min_vol=${min_volume:,.0f}, recency={recency_label})..."
+    )
+
+    cutoff_dt = None
+    if max_days_old is not None:
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=max_days_old)
+
     url = f"{GAMMA_API_BASE}/markets"
+    # Fetch more than needed since we filter
+    fetch_limit = max(limit * 5, 200)
     params = {
         "closed": "true",
-        "limit": limit * 3,  # fetch extra since we filter
+        "limit": fetch_limit,
         "order": "volume",
         "ascending": "false",
     }
@@ -81,8 +114,9 @@ def fetch_resolved_markets(limit: int = 50, min_volume: float = 50000) -> list[d
         return []
 
     results = []
+    skipped_recency = 0
+
     for m in raw:
-        # Parse outcome from snapped prices
         prices = json.loads(m.get("outcomePrices", "[]"))
         if len(prices) < 2:
             continue
@@ -94,14 +128,33 @@ def fetch_resolved_markets(limit: int = 50, min_volume: float = 50000) -> list[d
         if 0.05 < yes_price < 0.95:
             continue
 
-        # Volume filter
         if vol < min_volume:
             continue
 
-        # Skip trivially short questions
         q = m.get("question", "")
         if len(q) < 15:
             continue
+
+        # ── Recency filter ──────────────────────────────────────────────────
+        # Only apply when --days is set (for news-enabled runs).
+        # This ensures the news fetched is genuinely useful context,
+        # not a post-hoc report of an outcome from months ago.
+        if cutoff_dt is not None:
+            end_date_str = m.get("endDateIso") or m.get("endDate", "")
+            if not end_date_str:
+                skipped_recency += 1
+                continue
+            try:
+                end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                # Normalize to UTC if the API returned a naive datetime
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=timezone.utc)
+                if end_dt < cutoff_dt:
+                    skipped_recency += 1
+                    continue
+            except ValueError:
+                skipped_recency += 1
+                continue
 
         outcome = "YES" if yes_price >= 0.95 else "NO"
 
@@ -111,23 +164,36 @@ def fetch_resolved_markets(limit: int = 50, min_volume: float = 50000) -> list[d
             "description": m.get("description", "")[:500],
             "outcome": outcome,
             "volume": vol,
-            "end_date": m.get("endDate", "")[:10],
+            "end_date": (m.get("endDateIso") or m.get("endDate", ""))[:10],
         })
 
         if len(results) >= limit:
             break
 
+    if skipped_recency:
+        logger.info(f"Skipped {skipped_recency} markets outside recency window")
+
     logger.info(f"Found {len(results)} resolved markets for backtesting")
     return results
 
 
-def backtest_market(market_data: dict, backend, bankroll: float, edge_threshold: float) -> BacktestResult | None:
+def backtest_market(
+    market_data: dict,
+    backend,
+    bankroll: float,
+    edge_threshold: float,
+    include_news: bool = False,
+) -> BacktestResult | None:
     """
-    Run a single resolved market through the model WITHOUT news.
-    Returns BacktestResult or None if analysis fails.
+    Run a single resolved market through the model.
+
+    We hide the market price (set to 0.50) so the model must reason
+    independently — it can't just echo the crowd.
+
+    When include_news=True, the model also gets recent DuckDuckGo headlines.
+    This is valid for recently resolved markets (--days flag) since the
+    news reflects genuinely contemporaneous information.
     """
-    # Build a Market object (use 0.50/0.50 as "unknown" prices to not leak info)
-    # The model should estimate probability purely from the question + description
     market = Market(
         id=market_data["id"],
         question=market_data["question"],
@@ -141,17 +207,14 @@ def backtest_market(market_data: dict, backend, bankroll: float, edge_threshold:
         slug="",
     )
 
-    # Analyze WITHOUT news (include_news=False to prevent data leakage)
-    analysis = analyze_market(market, backend, include_news=False)
+    analysis = analyze_market(market, backend, include_news=include_news)
     if analysis is None:
         return None
 
-    # Calculate edge vs a 50/50 baseline (since we hid the market price)
     model_prob = analysis.estimated_probability
     actual_outcome = market_data["outcome"]
-    actual_value = 1.0 if actual_outcome == "YES" else 0.0
 
-    # Determine what the model would bet
+    # Determine what the model would bet (vs 50/50 baseline)
     if model_prob > 0.50 + edge_threshold:
         direction = "YES"
         edge = model_prob - 0.50
@@ -162,7 +225,6 @@ def backtest_market(market_data: dict, backend, bankroll: float, edge_threshold:
         direction = "SKIP"
         edge = abs(model_prob - 0.50)
 
-    # Kelly sizing (vs 50/50 baseline)
     stake = 0.0
     if direction != "SKIP":
         stake = kelly_stake(
@@ -172,19 +234,12 @@ def backtest_market(market_data: dict, backend, bankroll: float, edge_threshold:
             direction=direction,
         )
 
-    # Did we win?
     won = False
     pnl = 0.0
     if stake > 0:
-        if direction == "YES":
-            won = actual_outcome == "YES"
-        else:
-            won = actual_outcome == "NO"
-
-        if won:
-            pnl = stake * (1 / 0.50 - 1)  # payout at 50/50 odds = 2x - stake = +stake
-        else:
-            pnl = -stake
+        won = (direction == "YES" and actual_outcome == "YES") or \
+              (direction == "NO"  and actual_outcome == "NO")
+        pnl = stake * (1 / 0.50 - 1) if won else -stake
 
     return BacktestResult(
         market_id=market_data["id"],
@@ -197,19 +252,24 @@ def backtest_market(market_data: dict, backend, bankroll: float, edge_threshold:
         stake=stake,
         won=won,
         pnl=pnl,
+        end_date=market_data["end_date"],
+        news_used=include_news,
     )
 
 
-def print_results(results: list[BacktestResult]):
+def print_results(results: list[BacktestResult], include_news: bool, max_days_old: int | None):
     """Print detailed backtest results."""
+    news_label = "ENABLED ✓" if include_news else "DISABLED (no data leakage)"
+    recency_label = f"last {max_days_old} days" if max_days_old else "all time"
+
     print()
     print("╔══════════════════════════════════════════════════════════════════╗")
-    print("║               🧪 Backtest Results                              ║")
-    print("║               News: DISABLED (no data leakage)                 ║")
+    print("║               🧪 Backtest Results                               ║")
+    print(f"║  News:     {news_label:<53}║")
+    print(f"║  Recency:  {recency_label:<53}║")
     print("╚══════════════════════════════════════════════════════════════════╝")
 
-    # ── Per-market results ───────────────────────────────────────────────
-    bets = [r for r in results if r.direction != "SKIP"]
+    bets  = [r for r in results if r.direction != "SKIP"]
     skips = [r for r in results if r.direction == "SKIP"]
 
     print(f"\n  {'#':<4} {'Result':<8} {'Pred':>5} {'Actual':<6} {'Bet':<5} "
@@ -218,16 +278,12 @@ def print_results(results: list[BacktestResult]):
 
     for i, r in enumerate(results, 1):
         if r.direction == "SKIP":
-            icon = "⏭️"
-            result_str = "skip"
-            pnl_str = "   —"
+            icon, result_str, pnl_str = "⏭️", "skip", "   —"
         elif r.won:
-            icon = "✅"
-            result_str = "WIN"
+            icon, result_str = "✅", "WIN"
             pnl_str = f"${r.pnl:+.2f}"
         else:
-            icon = "❌"
-            result_str = "LOSS"
+            icon, result_str = "❌", "LOSS"
             pnl_str = f"${r.pnl:+.2f}"
 
         print(f"  {i:<4} {icon} {result_str:<5} {r.model_probability:>4.0%}  "
@@ -237,42 +293,42 @@ def print_results(results: list[BacktestResult]):
     # ── Summary stats ────────────────────────────────────────────────────
     print(f"\n{'═' * 65}")
 
-    # Brier score on ALL predictions
-    brier_sum = sum((r.model_probability - (1.0 if r.actual_outcome == "YES" else 0.0)) ** 2
-                    for r in results)
+    brier_sum = sum(
+        (r.model_probability - (1.0 if r.actual_outcome == "YES" else 0.0)) ** 2
+        for r in results
+    )
     brier = brier_sum / len(results)
 
-    # Win/loss on actual bets
-    wins = [r for r in bets if r.won]
-    losses = [r for r in bets if not r.won]
-    total_pnl = sum(r.pnl for r in bets)
+    wins        = [r for r in bets if r.won]
+    losses      = [r for r in bets if not r.won]
+    total_pnl   = sum(r.pnl for r in bets)
     total_staked = sum(r.stake for r in bets)
-    roi = (total_pnl / total_staked * 100) if total_staked > 0 else 0
+    roi         = (total_pnl / total_staked * 100) if total_staked > 0 else 0
 
     print(f"  Markets tested:    {len(results)}")
     print(f"  Bets placed:       {len(bets)} ({len(skips)} skipped)")
-    print(f"  Win / Loss:        {len(wins)}W / {len(losses)}L "
-          f"({len(wins)/len(bets)*100:.0f}% win rate)" if bets else "")
+    if bets:
+        print(f"  Win / Loss:        {len(wins)}W / {len(losses)}L "
+              f"({len(wins)/len(bets)*100:.0f}% win rate)")
     print(f"  Total staked:      ${total_staked:.2f}")
     print(f"  Net P&L:           ${total_pnl:+.2f}")
     print(f"  ROI:               {roi:+.1f}%")
 
     print(f"\n  Brier Score:       {brier:.4f}")
     if brier < 0.15:
-        print(f"  Assessment:        🏆 Excellent — model has real predictive power")
+        print("  Assessment:        🏆 Excellent — model has real predictive power")
     elif brier < 0.25:
-        print(f"  Assessment:        👍 Good — model adds signal over 50/50 baseline")
+        print("  Assessment:        👍 Good — model adds signal over 50/50 baseline")
     elif brier < 0.30:
-        print(f"  Assessment:        ⚠️  Marginal — close to no-skill baseline")
+        print("  Assessment:        ⚠️  Marginal — close to no-skill baseline")
     else:
-        print(f"  Assessment:        🚨 Poor — model is not well-calibrated")
+        print("  Assessment:        🚨 Poor — model is not well-calibrated")
 
     # ── Calibration buckets ──────────────────────────────────────────────
     print(f"\n  Calibration by prediction bucket:")
     print(f"  {'Bucket':<12} {'Count':<7} {'Model Avg':<11} {'Actual Rate':<12} {'Gap'}")
     print(f"  {'─'*50}")
 
-    from collections import defaultdict
     buckets = defaultdict(lambda: {"n": 0, "sum_p": 0.0, "sum_y": 0.0})
     for r in results:
         b = int(r.model_probability * 10) * 10
@@ -289,6 +345,11 @@ def print_results(results: list[BacktestResult]):
         gap_bar = "●" * min(int(gap * 20), 10)
         print(f"  {b}-{b+10}%      {d['n']:<7} {avg_p:<11.1%} {avg_y:<12.1%} {gap_bar}")
 
+    # ── News impact note ─────────────────────────────────────────────────
+    if include_news:
+        print(f"\n  ℹ️  News was ENABLED. Run without --news on the same markets")
+        print(f"     to measure the raw lift news context provides.")
+
     # ── Verdict ──────────────────────────────────────────────────────────
     print(f"\n{'─' * 65}")
     if brier < 0.20 and roi > 0:
@@ -304,13 +365,43 @@ def print_results(results: list[BacktestResult]):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Backtest model against resolved Polymarket data")
-    parser.add_argument("--markets", type=int, default=20, help="Number of resolved markets to test")
-    parser.add_argument("--min-volume", type=float, default=50000, help="Minimum volume filter")
+    parser = argparse.ArgumentParser(
+        description="Backtest model against resolved Polymarket data",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python backtest.py                         # 20 markets, no news (safe baseline)
+  python backtest.py --news --days 7         # Recent markets WITH news (live sim)
+  python backtest.py --news --days 3 --markets 30
+  python backtest.py --markets 50 --min-volume 25000
+
+News + recency guidance:
+  --news without --days   ⚠️  Risk of data leakage on old resolved markets.
+                              The news may literally report the outcome.
+  --news --days 7         ✅  Safe. News is contemporaneous with resolution.
+  --news --days 30        ⚠️  Marginal. Some leakage risk for older markets.
+        """
+    )
+    parser.add_argument("--markets",        type=int,   default=20,
+                        help="Number of resolved markets to test (default: 20)")
+    parser.add_argument("--min-volume",     type=float, default=50000,
+                        help="Minimum volume filter (default: $50,000)")
     parser.add_argument("--edge-threshold", type=float, default=0.08,
-                        help="Min edge to place bet (default 8%%)")
-    parser.add_argument("--bankroll", type=float, default=100, help="Simulated bankroll")
+                        help="Min edge to place bet (default: 8%%)")
+    parser.add_argument("--bankroll",       type=float, default=100,
+                        help="Simulated bankroll (default: $100)")
+    parser.add_argument("--news",           action="store_true",
+                        help="Enable DuckDuckGo news context for each market")
+    parser.add_argument("--days",           type=int,   default=None,
+                        help="Only test markets resolved within last N days. "
+                             "Recommended when using --news to avoid data leakage.")
     args = parser.parse_args()
+
+    # Warn if news is enabled without a recency filter
+    if args.news and args.days is None:
+        print("⚠️  WARNING: --news enabled without --days.")
+        print("   Old resolved markets risk data leakage — news may describe the outcome.")
+        print("   Consider: python backtest.py --news --days 7\n")
 
     # Init LLM backend
     try:
@@ -321,40 +412,59 @@ def main():
         sys.exit(1)
 
     # Fetch resolved markets
-    resolved = fetch_resolved_markets(limit=args.markets, min_volume=args.min_volume)
+    resolved = fetch_resolved_markets(
+        limit=args.markets,
+        min_volume=args.min_volume,
+        max_days_old=args.days,
+    )
+
     if not resolved:
-        print("No resolved markets found. Try lowering --min-volume.")
+        msg = "No resolved markets found."
+        if args.days:
+            msg += f" Try increasing --days (currently {args.days}) or lowering --min-volume."
+        else:
+            msg += " Try lowering --min-volume."
+        print(msg)
         return
 
     # Run backtest
-    print(f"\n🧪 Backtesting {len(resolved)} markets (news DISABLED)...")
-    print(f"   Backend: {backend.name}")
-    print(f"   Edge threshold: {args.edge_threshold:.0%}")
-    print(f"   Bankroll: ${args.bankroll:.0f}")
+    news_label = "ENABLED" if args.news else "DISABLED"
+    days_label = f"last {args.days}d" if args.days else "all time"
+    print(f"\n🧪 Backtesting {len(resolved)} markets...")
+    print(f"   Backend:   {backend.name}")
+    print(f"   News:      {news_label}")
+    print(f"   Recency:   {days_label}")
+    print(f"   Threshold: {args.edge_threshold:.0%}")
+    print(f"   Bankroll:  ${args.bankroll:.0f}\n")
 
     results = []
     for i, m in enumerate(resolved, 1):
         logger.info(f"[{i}/{len(resolved)}] {m['question'][:60]}...")
-        result = backtest_market(m, backend, args.bankroll, args.edge_threshold)
+        result = backtest_market(
+            m, backend, args.bankroll, args.edge_threshold,
+            include_news=args.news,
+        )
         if result:
             results.append(result)
             icon = "✅" if result.won else ("❌" if result.direction != "SKIP" else "⏭️")
-            logger.info(f"  {icon} Pred: {result.model_probability:.0%} | "
-                        f"Actual: {result.actual_outcome} | Bet: {result.direction}")
+            logger.info(
+                f"  {icon} Pred: {result.model_probability:.0%} | "
+                f"Actual: {result.actual_outcome} | Bet: {result.direction}"
+            )
         else:
-            logger.warning(f"  ⚠ Analysis failed — skipping")
+            logger.warning("  ⚠ Analysis failed — skipping")
 
     if not results:
         print("All analyses failed. Check your API key.")
         return
 
-    # Save backtest results
+    # Save results
     output_path = Path(__file__).parent / "data" / "backtest_results.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps([asdict(r) for r in results], indent=2))
     logger.info(f"Results saved to {output_path}")
 
-    # Print report
-    print_results(results)
+    print_results(results, include_news=args.news, max_days_old=args.days)
 
 
 if __name__ == "__main__":

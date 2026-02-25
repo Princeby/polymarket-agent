@@ -1,6 +1,6 @@
 """
 LLM Reasoning Engine
-Dual-backend LLM interface (Ollama local + Groq cloud) with structured
+Triple-backend LLM interface (Ollama local + Groq cloud + OpenAI) with structured
 prompt engineering for prediction market probability estimation.
 """
 
@@ -32,6 +32,9 @@ You MUST reason systematically:
 Rules:
 - Be calibrated: when you say 70%, events should happen ~70% of the time.
 - Be conservative: account for unknown unknowns. Don't be overconfident.
+- Be decisive: the market price already reflects conventional wisdom. 
+- If your evidence points strongly in one direction, your probability 
+ should reflect that — don't anchor to 50%. Underconfidence is as harmful as overconfidence.
 - Consider the time horizon: how much can change before resolution?
 - A market priced at $0.60 implies 60% probability. Only flag edge if your estimate
   differs from the market price by a meaningful amount.
@@ -228,18 +231,161 @@ class OllamaBackend(LLMBackend):
             return None
 
 
+class OpenAIBackend(LLMBackend):
+    """
+    OpenAI API backend.
+    Supports all chat-capable models: gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-3.5-turbo, etc.
+
+    Required env vars:
+        OPENAI_API_KEY  — your OpenAI API key (https://platform.openai.com/api-keys)
+
+    Optional env vars:
+        OPENAI_MODEL    — model to use (default: gpt-4o-mini)
+        OPENAI_BASE_URL — override for Azure OpenAI or custom proxy endpoints
+    """
+
+    # Models that support the json_object response format.
+    # Older models (gpt-3.5-turbo < 1106, gpt-4 < 1106) don't support it.
+    JSON_MODE_MODELS = {
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4-turbo",
+        "gpt-4-turbo-preview",
+        "gpt-4-1106-preview",
+        "gpt-3.5-turbo",
+        "gpt-3.5-turbo-1106",
+        "gpt-3.5-turbo-0125",
+        "o1",
+        "o1-mini",
+        "o3",
+        "o3-mini",
+        "o4-mini",
+    }
+
+    def __init__(self):
+        self.api_key = os.getenv("OPENAI_API_KEY", "")
+        self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.base_url = os.getenv(
+            "OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions"
+        )
+
+        if not self.api_key:
+            raise ValueError(
+                "OPENAI_API_KEY not set. Get a key at https://platform.openai.com/api-keys"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"OpenAI ({self.model})"
+
+    def _supports_json_mode(self) -> bool:
+        """Check if the selected model supports response_format=json_object."""
+        # Strip version suffixes like -2024-11-20 for matching
+        base = self.model.split("-2024")[0].split("-2025")[0]
+        return base in self.JSON_MODE_MODELS or self.model in self.JSON_MODE_MODELS
+
+    def query(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        import time as _time
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # o1/o3 family uses different parameters (no system role, no temperature)
+        is_reasoning_model = self.model.startswith(("o1", "o3", "o4"))
+
+        if is_reasoning_model:
+            # Reasoning models don't support system messages or temperature.
+            # Merge system prompt into the user message.
+            messages = [
+                {
+                    "role": "user",
+                    "content": f"{system_prompt}\n\n{user_prompt}",
+                }
+            ]
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "max_completion_tokens": 2048,
+            }
+        else:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": 0.2,
+                "max_tokens": 1024,
+            }
+            # Enable JSON mode if supported (guarantees parseable output)
+            if self._supports_json_mode():
+                payload["response_format"] = {"type": "json_object"}
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                resp = requests.post(
+                    self.base_url, headers=headers, json=payload, timeout=60
+                )
+
+                if resp.status_code == 429:
+                    # Respect Retry-After header if present
+                    retry_after = float(resp.headers.get("retry-after", 5 * (attempt + 1)))
+                    logger.warning(
+                        f"OpenAI rate limited, waiting {retry_after:.0f}s "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    _time.sleep(retry_after)
+                    continue
+
+                if resp.status_code == 400:
+                    try:
+                        err = resp.json().get("error", {})
+                        logger.error(f"OpenAI 400 Bad Request: {err.get('message', resp.text[:200])}")
+                    except Exception:
+                        logger.error(f"OpenAI 400 Bad Request: {resp.text[:200]}")
+                    return None  # Not retryable
+
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+
+            except requests.RequestException as e:
+                logger.error(f"OpenAI request error (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    _time.sleep(2 ** attempt)
+            except (KeyError, IndexError) as e:
+                logger.error(f"Unexpected OpenAI response format: {e}")
+                return None
+
+        logger.error("OpenAI: max retries exceeded")
+        return None
+
+
 # ── Public Interface ─────────────────────────────────────────────────────────
 
 def get_backend() -> LLMBackend:
-    """Factory: return the right LLM backend based on LLM_BACKEND env var."""
+    """
+    Factory: return the right LLM backend based on LLM_BACKEND env var.
+
+    Supported values:
+        groq    — Groq cloud API (default)
+        ollama  — Local Ollama instance
+        openai  — OpenAI API (gpt-4o-mini by default)
+    """
     backend_name = os.getenv("LLM_BACKEND", "groq").lower()
     if backend_name == "ollama":
         return OllamaBackend()
     elif backend_name == "groq":
         return GroqBackend()
+    elif backend_name == "openai":
+        return OpenAIBackend()
     else:
         raise ValueError(
-            f"Unknown LLM_BACKEND '{backend_name}'. Use 'groq' or 'ollama'."
+            f"Unknown LLM_BACKEND '{backend_name}'. Use 'groq', 'ollama', or 'openai'."
         )
 
 
