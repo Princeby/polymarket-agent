@@ -1,7 +1,7 @@
 """
 Trade Execution & Risk Management
 Position sizing (Kelly criterion), dry-run execution, trade logging,
-and portfolio summary.
+portfolio summary, and open position deduplication.
 """
 
 import json
@@ -20,7 +20,7 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 TRADE_LOG_PATH = DATA_DIR / "trade_history.json"
 
 
-# ── Position Sizing ──────────────────────────────────────────────────────────
+# ── Position Sizing ────────────────────────────────────────────────────────────
 
 def kelly_stake(
     bankroll: float,
@@ -34,19 +34,19 @@ def kelly_stake(
     Calculate position size using fractional Kelly criterion for binary markets.
 
     In a binary prediction market:
-    - Buying YES at price p: you pay p, win (1 - p) profit if correct
-    - Buying NO at price (1-p): you pay (1-p), win p profit if correct
+      - Buying YES at price p: you pay p, win (1 - p) profit if correct
+      - Buying NO at price (1-p): you pay (1-p), win p profit if correct
 
-    Kelly formula for binary bets: f* = (edge) / (price_paid_for_contract)
-    where edge = |model_prob - market_prob|
+    Kelly formula for binary bets:
+        f* = edge / cost_per_contract
 
     Args:
-        bankroll: Current total bankroll in USD.
-        edge: Absolute edge between model and market probability.
+        bankroll:    Current total bankroll in USD.
+        edge:        Absolute edge between model and market probability.
         market_price: Current YES price on the market (0 to 1).
-        direction: "YES" or "NO" — which side we're betting.
-        fraction: Kelly fraction (0.25 = quarter-Kelly, much safer).
-        max_pct: Maximum percentage of bankroll per trade (hard cap).
+        direction:   "YES" or "NO" — which side we're betting.
+        fraction:    Kelly fraction (0.25 = quarter-Kelly, much safer).
+        max_pct:     Maximum percentage of bankroll per trade (hard cap).
 
     Returns:
         Dollar amount to stake.
@@ -54,33 +54,21 @@ def kelly_stake(
     if edge <= 0 or bankroll <= 0:
         return 0.0
 
-    # Cost per contract depends on direction
-    if direction == "YES":
-        cost = market_price  # pay market_price, win (1 - market_price)
-    else:
-        cost = 1 - market_price  # pay (1 - market_price), win market_price
-
+    cost = market_price if direction == "YES" else 1 - market_price
     if cost <= 0 or cost >= 1:
         return 0.0
 
-    # Kelly for binary: f* = edge / cost
     kelly_full = edge / cost
-
-    # Apply Kelly fraction for safety
     stake = bankroll * kelly_full * fraction
+    stake = min(stake, bankroll * max_pct)
 
-    # Hard cap
-    max_stake = bankroll * max_pct
-    stake = min(stake, max_stake)
-
-    # Minimum trade size ($5 on Polymarket)
-    if stake < 5.0:
+    if stake < 5.0:  # Polymarket minimum
         return 0.0
 
     return round(stake, 2)
 
 
-# ── Trade Logging ────────────────────────────────────────────────────────────
+# ── Trade Logging ──────────────────────────────────────────────────────────────
 
 class TradeLogger:
     """Logs every trade decision (including skips) to a JSON file."""
@@ -97,6 +85,40 @@ class TradeLogger:
         except (json.JSONDecodeError, FileNotFoundError):
             return []
 
+    # ── Position Deduplication ─────────────────────────────────────────────────
+
+    def get_open_position_ids(self) -> set:
+        """
+        Return the set of market IDs where we have an active (unresolved) bet.
+
+        A position is 'open' when:
+          - An entry with action_taken containing 'BET' exists for that market, AND
+          - No entry for that market has a 'resolved_outcome' yet.
+
+        This prevents the agent from doubling into the same market across cycles.
+        """
+        log = self._read_log()
+        bet_markets: set[str] = set()
+        resolved_markets: set[str] = set()
+
+        for entry in log:
+            mid = entry.get("market_id", "")
+            if not mid:
+                continue
+            if "BET" in entry.get("action_taken", ""):
+                bet_markets.add(mid)
+            if "resolved_outcome" in entry:
+                resolved_markets.add(mid)
+
+        # Open = we bet on it, but it hasn't resolved yet
+        return bet_markets - resolved_markets
+
+    def is_open_position(self, market_id: str) -> bool:
+        """Return True if we already hold an unresolved bet on this market."""
+        return market_id in self.get_open_position_ids()
+
+    # ── Core Logging ───────────────────────────────────────────────────────────
+
     def log_decision(
         self,
         market: Market,
@@ -109,10 +131,10 @@ class TradeLogger:
         Append a trade decision to the log.
 
         Args:
-            market: The market that was analyzed.
-            analysis: LLM analysis result (None if analysis failed).
-            edge_info: Edge calculation dict (None if analysis failed).
-            stake: Dollar amount staked (0 if skipped).
+            market:       The market that was analyzed.
+            analysis:     LLM analysis result (None if analysis failed).
+            edge_info:    Edge calculation dict (None if analysis failed).
+            stake:        Dollar amount staked (0 if skipped).
             action_taken: What happened — "DRY_RUN_BET_YES", "SKIPPED", etc.
         """
         entry = {
@@ -147,7 +169,6 @@ class TradeLogger:
         log = self._read_log()
         log.append(entry)
         self.log_path.write_text(json.dumps(log, indent=2))
-
         logger.info(f"Logged: {action_taken} | {market.question[:50]}... | ${stake:.2f}")
 
     def resolve_market(self, market_id: str, outcome: str) -> bool:
@@ -157,7 +178,7 @@ class TradeLogger:
 
         Args:
             market_id: The Polymarket market ID.
-            outcome: "YES" or "NO".
+            outcome:   "YES" or "NO".
 
         Returns:
             True if any entries were updated.
@@ -188,9 +209,9 @@ class TradeLogger:
         Calculate Brier score and calibration metrics on resolved markets.
 
         Brier score = mean of (forecast - outcome)^2
-        - 0.0 = perfect calibration
-        - 0.25 = coin-flip baseline (no skill)
-        - Higher = worse than random
+          - 0.0  = perfect calibration
+          - 0.25 = coin-flip baseline (no skill)
+          - Higher = worse than random
 
         Returns:
             Dict with brier_score, num_resolved, calibration buckets, etc.
@@ -207,20 +228,16 @@ class TradeLogger:
                 "message": "No resolved markets yet. Run for 2-4 weeks, then resolve markets.",
             }
 
-        # Brier score
-        brier_sum = 0.0
-        for e in resolved:
-            forecast = e["model_probability"]
-            actual = e["outcome_value"]
-            brier_sum += (forecast - actual) ** 2
-
+        brier_sum = sum(
+            (e["model_probability"] - e["outcome_value"]) ** 2
+            for e in resolved
+        )
         brier_score = brier_sum / len(resolved)
 
-        # Calibration buckets: group predictions into 10% bins
         buckets = {}
         for e in resolved:
-            bucket = int(e["model_probability"] * 10) * 10  # 0, 10, 20, ...90
-            bucket = min(bucket, 90)  # cap at 90
+            bucket = int(e["model_probability"] * 10) * 10
+            bucket = min(bucket, 90)
             if bucket not in buckets:
                 buckets[bucket] = {"count": 0, "sum_forecast": 0.0, "sum_actual": 0.0}
             buckets[bucket]["count"] += 1
@@ -259,7 +276,7 @@ class TradeLogger:
         for e in log:
             mid = e.get("market_id", "")
             if mid and mid not in seen and "outcome_value" not in e:
-                if "model_probability" in e:  # Only markets with actual predictions
+                if "model_probability" in e:
                     seen.add(mid)
                     unresolved.append({
                         "market_id": mid,
@@ -282,14 +299,14 @@ class TradeLogger:
         total_staked = sum(e.get("stake_usd", 0) for e in trades)
         avg_edge = (
             sum(e.get("abs_edge", 0) for e in trades) / len(trades)
-            if trades
-            else 0
+            if trades else 0
         )
 
         summary = {
             "total_decisions": len(log),
             "trades_placed": len(trades),
             "trades_skipped": len(skips),
+            "open_positions": len(self.get_open_position_ids()),
             "total_staked_usd": round(total_staked, 2),
             "avg_edge": round(avg_edge, 4),
             "markets_resolved": len(set(e["market_id"] for e in resolved)),
@@ -297,7 +314,6 @@ class TradeLogger:
             "last_trade": log[-1]["timestamp"] if log else None,
         }
 
-        # Include Brier score if we have resolved markets
         cal = self.get_calibration()
         if cal.get("brier_score") is not None:
             summary["brier_score"] = cal["brier_score"]
@@ -306,7 +322,7 @@ class TradeLogger:
         return summary
 
 
-# ── Trade Execution ──────────────────────────────────────────────────────────
+# ── Trade Execution ────────────────────────────────────────────────────────────
 
 def execute_trade(
     market: Market,
@@ -318,10 +334,10 @@ def execute_trade(
     Execute a trade on Polymarket (or log it in dry-run mode).
 
     Args:
-        market: The market to trade on.
+        market:    The market to trade on.
         direction: "YES" or "NO".
-        stake: Dollar amount to stake.
-        dry_run: If True, only log what would happen. If False, place real order.
+        stake:     Dollar amount to stake.
+        dry_run:   If True, only log what would happen. If False, place real order.
 
     Returns:
         String describing what happened.
@@ -329,7 +345,8 @@ def execute_trade(
     if dry_run:
         msg = (
             f"[DRY RUN] Would BET {direction} on: {market.question[:60]}...\n"
-            f"  Stake: ${stake:.2f} | Price: {market.yes_price if direction == 'YES' else market.no_price:.4f}"
+            f"  Stake: ${stake:.2f} | "
+            f"Price: {market.yes_price if direction == 'YES' else market.no_price:.4f}"
         )
         logger.info(msg)
         return f"DRY_RUN_BET_{direction}"
@@ -347,7 +364,6 @@ def execute_trade(
     #     chain_id=137,  # Polygon mainnet
     # )
     #
-    # # token_id depends on YES vs NO outcome
     # token_ids = json.loads(market.raw.get("clobTokenIds", "[]"))
     # token_id = token_ids[0] if direction == "YES" else token_ids[1]
     #

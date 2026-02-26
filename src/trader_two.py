@@ -1,6 +1,6 @@
 """
 Trade Execution & Risk Management
-Position sizing (Kelly criterion), dry-run execution, trade logging,
+Position sizing (Kelly criterion), live/dry-run execution, trade logging,
 portfolio summary, and open position deduplication.
 """
 
@@ -351,35 +351,75 @@ def execute_trade(
         logger.info(msg)
         return f"DRY_RUN_BET_{direction}"
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # REAL EXECUTION — Uncomment when ready to trade with real money
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    #
-    # from py_clob_client.client import ClobClient
-    # from py_clob_client.clob_types import OrderArgs
-    #
-    # client = ClobClient(
-    #     host="https://clob.polymarket.com",
-    #     key=os.getenv("POLYMARKET_API_KEY"),
-    #     chain_id=137,  # Polygon mainnet
-    # )
-    #
-    # token_ids = json.loads(market.raw.get("clobTokenIds", "[]"))
-    # token_id = token_ids[0] if direction == "YES" else token_ids[1]
-    #
-    # order = client.create_order(
-    #     OrderArgs(
-    #         token_id=token_id,
-    #         price=market.yes_price if direction == "YES" else market.no_price,
-    #         size=stake / (market.yes_price if direction == "YES" else market.no_price),
-    #         side="BUY",
-    #     )
-    # )
-    # result = client.post_order(order)
-    # logger.info(f"Order placed: {result}")
-    # return f"LIVE_BET_{direction}"
-    #
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ── Live Execution ─────────────────────────────────────────────────────────
+    if not market.clob_token_ids or len(market.clob_token_ids) < 2:
+        logger.error(
+            f"No CLOB token IDs for market {market.id} — cannot place order. "
+            f"Market may not support CLOB trading."
+        )
+        return "FAILED_NO_TOKEN_IDS"
 
-    logger.warning("Live trading is not yet implemented. Set DRY_RUN=true.")
-    return "NOT_IMPLEMENTED"
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import OrderArgs, ApiCreds
+
+        private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+        api_key = os.getenv("POLYMARKET_API_KEY", "")
+        api_secret = os.getenv("POLYMARKET_API_SECRET", "")
+        api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+
+        if not private_key:
+            logger.error("POLYMARKET_PRIVATE_KEY not set in .env")
+            return "FAILED_NO_CREDENTIALS"
+
+        creds = None
+        if api_key and api_secret and api_passphrase:
+            creds = ApiCreds(
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+            )
+
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=private_key,
+            chain_id=137,  # Polygon mainnet
+            creds=creds,
+        )
+
+        # Derive API credentials on first run if not provided
+        if creds is None:
+            logger.info("No API credentials found — deriving from private key...")
+            derived = client.derive_api_key()
+            logger.info(
+                f"Derived creds (save these to .env to skip derivation next run):\n"
+                f"  POLYMARKET_API_KEY={derived.api_key}\n"
+                f"  POLYMARKET_API_SECRET={derived.api_secret}\n"
+                f"  POLYMARKET_API_PASSPHRASE={derived.api_passphrase}"
+            )
+
+        token_id = market.clob_token_ids[0] if direction == "YES" else market.clob_token_ids[1]
+        price = market.yes_price if direction == "YES" else market.no_price
+        size = round(stake / price, 4)  # number of contracts
+
+        order = client.create_order(
+            OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=size,
+                side="BUY",
+            )
+        )
+        result = client.post_order(order)
+        logger.info(
+            f"[LIVE] Order placed: {direction} {size:.4f} contracts @ {price:.4f} "
+            f"on '{market.question[:50]}...' | result={result}"
+        )
+        return f"LIVE_BET_{direction}"
+
+    except ImportError:
+        logger.error("py-clob-client not installed. Run: pip install py-clob-client")
+        return "FAILED_MISSING_PACKAGE"
+    except Exception as e:
+        logger.error(f"Order placement failed for market {market.id}: {e}", exc_info=True)
+        return f"FAILED_ORDER_ERROR"
