@@ -2,14 +2,12 @@
 Polymarket Prediction Market Trading Agent
 Main entry point — orchestrates the full agent loop.
 
-Changes from v1:
-  - Category filter: hard-blocks Politics/Geo and short-window crypto noise
-  - Sports: soft-block (allowed but requires higher confidence + edge)
-  - Pre-analysis filter runs BEFORE the LLM call to save API budget
-  - Low-confidence bets now only blocked on high-variance categories
-  - --no-news flag to disable news fetching (faster, for testing)
-  - --block-sports flag to hard-block sports in addition to politics
-  - Cycle summary now shows category breakdown of skips vs bets
+Changes from v2:
+  - REMOVED requires_high_confidence gate: medium confidence bets are now allowed.
+    Rationale: the model almost never returns "high" confidence, causing near-zero
+    trade frequency on live markets. Backtest showed medium confidence is profitable.
+  - Low-confidence bets still always skipped.
+  - Added --strict flag to re-enable the old high-confidence-only behaviour if needed.
 
 Usage:
     python main.py                        # Continuous loop, dry run
@@ -17,6 +15,7 @@ Usage:
     python main.py --once --markets 5     # Single pass, 5 markets
     python main.py --verbose              # Show full LLM reasoning
     python main.py --once --no-news       # Disable news (faster, no signal boost)
+    python main.py --strict               # Require high confidence (old behaviour)
     python main.py --summary              # Portfolio summary
     python main.py --calibration          # Brier score report
     python main.py --unresolved           # Markets awaiting resolution
@@ -62,31 +61,17 @@ def print_banner() -> None:
 
 
 # ── Category Filter ────────────────────────────────────────────────────────────
-#
-# Based on 200-market backtest results:
-#   Politics/Geo:  45% win, Brier 0.347  → HARD BLOCK
-#   Short crypto:  ~50% win, Brier ~0.25 → HARD BLOCK (pure noise)
-#   Sports:        62% win on 8 bets     → SOFT BLOCK (needs higher bar)
-#
-# The model fails on Politics because it applies stale training priors
-# (e.g. "Russia won't advance", "deals are unlikely") with no real-time
-# information. Even with news enabled, geopolitical prediction requires
-# deep context the model doesn't reliably have.
 
-# Hard blocked regardless of any flags — model is systematically wrong
 HARD_BLOCK_PATTERNS = [
-    # Short-window crypto Up/Down — pure random walk, zero model edge
-    "up or down - ",        # "Bitcoin Up or Down - October 22, 12:00PM-4:00PM"
+    "up or down - ",
     "up or down – ",
-    "up or down on ",       # "Ethereum Up or Down on January 3"
-    # Sports spreads and O/U — model has ~50% win rate historically
+    "up or down on ",
     "spread:",
     " o/u ",
     ": o/u ",
     "o/u ",
 ]
 
-# Politics/Geo — blocked by default, can enable with --allow-politics flag
 POLITICS_PATTERNS = [
     "will russia ", "will ukraine", "capture territory",
     "will israel ", "will nato ", "will saudi",
@@ -96,7 +81,6 @@ POLITICS_PATTERNS = [
     "electoral college", "popular vote",
 ]
 
-# Speech prediction markets — model has no real signal here
 SPEECH_PATTERNS = [
     "will trump say ",
     "will biden say ",
@@ -107,9 +91,8 @@ SPEECH_PATTERNS = [
     "will donald trump say",
 ]
 
-# Sports — soft blocked by default (require --allow-sports to trade)
 SPORTS_PATTERNS = [
-    " vs. ",           # "Reds vs. Royals" style
+    " vs. ",
     " vs ",
     "nba: ",
     "nfl: ",
@@ -146,63 +129,30 @@ def should_skip_market(
 ) -> tuple[bool, str]:
     """
     Returns (should_skip, reason) based on category filters.
-
-    Hard blocks always apply regardless of flags.
-    Soft blocks (politics, sports, speech) can be overridden.
-
-    Args:
-        question:       Market question text.
-        allow_politics: If True, don't block politics markets.
-        allow_sports:   If True, don't block sports markets.
-        allow_speech:   If True, don't block speech prediction markets.
-
-    Returns:
-        (True, reason_string) if market should be skipped.
-        (False, "") if market should proceed to analysis.
+    Hard blocks always apply. Soft blocks can be overridden with flags.
     """
     q = question.lower()
 
-    # Hard blocks — never trade these
     for pattern in HARD_BLOCK_PATTERNS:
         if pattern in q:
             return True, f"HARD_BLOCK:{pattern.strip().upper()}"
 
-    # Politics — blocked by default
     if not allow_politics:
         for pattern in POLITICS_PATTERNS:
             if pattern in q:
                 return True, "POLITICS_GEO"
 
-    # Speech predictions — blocked by default
     if not allow_speech:
         for pattern in SPEECH_PATTERNS:
             if pattern in q:
                 return True, "SPEECH_PREDICTION"
 
-    # Sports — blocked by default
     if not allow_sports:
         for pattern in SPORTS_PATTERNS:
             if pattern in q:
                 return True, "SPORTS"
 
     return False, ""
-
-
-def requires_high_confidence(question: str) -> bool:
-    """
-    Returns True for categories where we require high (not just medium)
-    confidence before placing a bet.
-
-    Weather and niche "Other" markets are fine with medium confidence.
-    Anything involving uncertain future events needs high confidence.
-    """
-    q = question.lower()
-    uncertain_patterns = [
-        "will ", "by ", "before ", "reach ", "hit ",
-        "above ", "below ", "between ",
-    ]
-    # If it's a forward-looking binary question, require higher confidence
-    return q.startswith("will ") or any(q.startswith(p) for p in ["will ", "is ", "does "])
 
 
 # ── Main Cycle ─────────────────────────────────────────────────────────────────
@@ -220,14 +170,16 @@ def run_cycle(
     allow_sports: bool,
     allow_speech: bool,
     use_news: bool,
+    strict_confidence: bool,
 ) -> dict:
     """
     Run one full cycle: fetch → pre-filter → analyze → size → execute.
 
-    Returns a summary dict with counts for logging.
+    strict_confidence=True restores the old behaviour of requiring "high"
+    confidence on forward-looking binary markets. Default is False (allow medium).
     """
     logger = logging.getLogger(__name__)
-    counts = defaultdict(int)  # tracks skip reasons and bets
+    counts = defaultdict(int)
 
     # ── 1. Fetch Markets ───────────────────────────────────────────────────────
     logger.info("Fetching active markets from Polymarket...")
@@ -268,7 +220,6 @@ def run_cycle(
             continue
 
         # ── Pre-analysis category filter ───────────────────────────────────────
-        # This runs BEFORE the LLM call to save API budget on known-bad categories
         skip, reason = should_skip_market(
             market.question,
             allow_politics=allow_politics,
@@ -320,9 +271,8 @@ def run_cycle(
             continue
 
         # ── Confidence Check ───────────────────────────────────────────────────
-        # Low confidence always skips.
-        # Medium confidence skips on forward-looking binary questions
-        # (where the model is more likely to be guessing).
+        # Low confidence: always skip.
+        # Medium confidence: allowed by default. Use --strict to require high.
         if analysis.confidence == "low":
             print("  ✗ Low confidence — SKIP")
             counts["skip_low_confidence"] += 1
@@ -331,8 +281,8 @@ def run_cycle(
             )
             continue
 
-        if analysis.confidence == "medium" and requires_high_confidence(market.question):
-            print("  ✗ Medium confidence on uncertain market — SKIP")
+        if strict_confidence and analysis.confidence == "medium":
+            print("  ✗ Medium confidence (--strict mode) — SKIP")
             counts["skip_medium_confidence"] += 1
             trade_logger.log_decision(
                 market, analysis, edge_info, 0, "SKIPPED_MEDIUM_CONFIDENCE"
@@ -395,11 +345,16 @@ def main() -> None:
     parser.add_argument("--markets",     type=int, default=10, help="Max markets per cycle")
     parser.add_argument("--verbose",     action="store_true", help="Show full LLM reasoning")
 
+    # Confidence mode
+    parser.add_argument("--strict",      action="store_true",
+                        help="Require HIGH confidence before betting (old behaviour). "
+                             "Default: medium confidence is allowed.")
+
     # Category controls
     parser.add_argument("--allow-politics", action="store_true",
-                        help="Allow Politics/Geo markets (blocked by default — model performs poorly)")
+                        help="Allow Politics/Geo markets (blocked by default)")
     parser.add_argument("--allow-sports",   action="store_true",
-                        help="Allow sports markets (blocked by default — insufficient edge)")
+                        help="Allow sports markets (blocked by default)")
     parser.add_argument("--allow-speech",   action="store_true",
                         help="Allow speech prediction markets (blocked by default)")
 
@@ -431,10 +386,11 @@ def main() -> None:
         for p in HARD_BLOCK_PATTERNS:
             print(f"    • '{p.strip()}'")
         print(f"\n  SOFT BLOCKED by default (override with flags):")
-        print(f"    Politics/Geo  (--allow-politics)  — Brier 0.347 in backtest")
-        print(f"    Speech        (--allow-speech)    — model has no signal here")
-        print(f"    Sports        (--allow-sports)    — 8-bet sample, needs more data")
-        print(f"\n  NEWS: {'DISABLED (--no-news)' if args.no_news else 'ENABLED'}")
+        print(f"    Politics/Geo  (--allow-politics)")
+        print(f"    Speech        (--allow-speech)")
+        print(f"    Sports        (--allow-sports)")
+        print(f"\n  CONFIDENCE MODE: {'STRICT (high only)' if args.strict else 'RELAXED (medium allowed)'}")
+        print(f"  NEWS: {'DISABLED (--no-news)' if args.no_news else 'ENABLED'}")
         print()
         return
 
@@ -509,13 +465,15 @@ def main() -> None:
     use_news      = not args.no_news
 
     mode_label = "🧪 DRY RUN" if dry_run else "🔴 LIVE TRADING"
+    conf_label = "strict (high only)" if args.strict else "relaxed (medium allowed) ✓"
+
     print(f"  Mode:       {mode_label}")
     print(f"  Bankroll:   ${bankroll:.2f}")
     print(f"  Markets:    {args.markets} per cycle")
     print(f"  Interval:   {scan_interval}s")
     print(f"  News:       {'enabled ✓' if use_news else 'disabled (--no-news)'}")
+    print(f"  Confidence: {conf_label}")
 
-    # Show which categories are active
     blocked = []
     if not args.allow_politics:
         blocked.append("Politics/Geo")
@@ -523,8 +481,8 @@ def main() -> None:
         blocked.append("Sports")
     if not args.allow_speech:
         blocked.append("Speech")
-    blocked.append("Short-window crypto")  # always blocked
-    blocked.append("Spreads/O/U")          # always blocked
+    blocked.append("Short-window crypto")
+    blocked.append("Spreads/O/U")
     print(f"  Blocked:    {', '.join(blocked)}")
 
     try:
@@ -561,6 +519,7 @@ def main() -> None:
                 allow_sports=args.allow_sports,
                 allow_speech=args.allow_speech,
                 use_news=use_news,
+                strict_confidence=args.strict,
             )
             print_cycle_summary(counts, cycle)
 
