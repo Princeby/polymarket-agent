@@ -7,7 +7,7 @@ No authentication required for read operations.
 import json
 import logging
 import requests
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,7 @@ class Market:
     end_date: str
     active: bool
     slug: str
+    clob_token_ids: list = field(default_factory=list)  # [yes_token_id, no_token_id]
 
     @property
     def implied_probability(self) -> float:
@@ -51,6 +52,13 @@ def _parse_market(raw: dict) -> Optional[Market]:
         if len(prices) < 2:
             return None
 
+        # clobTokenIds is a JSON string like '["<yes_token>", "<no_token>"]'
+        raw_token_ids = raw.get("clobTokenIds", "[]")
+        try:
+            clob_token_ids = json.loads(raw_token_ids) if isinstance(raw_token_ids, str) else raw_token_ids
+        except (json.JSONDecodeError, TypeError):
+            clob_token_ids = []
+
         return Market(
             id=raw.get("id", ""),
             question=raw.get("question", ""),
@@ -62,6 +70,7 @@ def _parse_market(raw: dict) -> Optional[Market]:
             end_date=raw.get("endDateIso", raw.get("endDate", "")),
             active=raw.get("active", False),
             slug=raw.get("slug", ""),
+            clob_token_ids=clob_token_ids,
         )
     except (json.JSONDecodeError, ValueError, TypeError) as e:
         logger.warning(f"Failed to parse market: {e}")
