@@ -12,3 +12,17 @@ data/
 
 # OS files
 .DS_Store
+
+# New additions
+repomix-output.xml
+config/.env
+data/agent_state.json
+prompts/versions/
+
+
+# New additions
+repomix-output.xml
+config/.env
+data/agent_state.json
+prompts/versions/
+

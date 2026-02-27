@@ -1,25 +1,14 @@
 #!/usr/bin/env python3
 """
-Model Quality Comparison for Polymarket Backtesting v2
-─────────────────────────────────────────────────────────
-Fixes from v1:
-  - qwen3-32b 400 errors: adds {"thinking": {"type": "disabled"}}
-  - Balanced YES/NO test set to avoid direction bias
-  - Directional accuracy (Dir%) metric
-  - Better verdict thresholds based on P-Std
+Model Quality Comparison for Polymarket Backtesting
+─────────────────────────────────────────────────────
+Compare multiple Groq models on the same resolved market set to find
+which one forecasts best before committing to it in production.
 
-Budget reminder (Groq free tier):
-  llama-3.1-8b-instant          → 14,400 RPD  (high budget, too weak)
-  llama-3.3-70b-versatile       →  1,000 RPD
-  meta-llama/llama-4-scout-*    →  1,000 RPD
-  meta-llama/llama-4-maverick-* →  1,000 RPD
-  qwen/qwen3-32b                →  1,000 RPD  (60 RPM)
-  moonshotai/kimi-k2-instruct   →  1,000 RPD  (60 RPM)
-
-Usage:
-    python model_compare.py                  # Compare top 4 models, 12 markets each
-    python model_compare.py --markets 20
-    python model_compare.py --model llama-3.3-70b-versatile --markets 20
+Usage (run from project root OR backtests/ folder):
+    python backtests/model_compare.py                  # Compare top 4 models, 12 markets
+    python backtests/model_compare.py --markets 20
+    python backtests/model_compare.py --model llama-3.3-70b-versatile --markets 20
 """
 
 import argparse
@@ -27,13 +16,20 @@ import json
 import logging
 import os
 import statistics
+import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+# ── Path fix: works whether run from root or from backtests/ ──────────────────
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+load_dotenv(_ROOT / ".env")
+# ─────────────────────────────────────────────────────────────────────────────
 
 for lib in ["urllib3", "requests", "primp"]:
     logging.getLogger(lib).setLevel(logging.WARNING)
@@ -55,7 +51,6 @@ CANDIDATE_MODELS = [
     "qwen/qwen3-32b",
 ]
 
-# These models require thinking to be explicitly disabled for json_object mode
 THINKING_MODELS = {
     "qwen/qwen3-32b",
     "qwen/qwen3-32b-preview",
@@ -76,7 +71,6 @@ Rules:
 - Be DECISIVE: commit to a view when you have evidence
 - Do NOT cluster near 50% — if you're uncertain, say 35% or 65%, not 48% or 52%
 - Use the full range: strong NO = 5-20%, moderate NO = 25-40%, toss-up = 45-55%, moderate YES = 60-75%, strong YES = 80-95%
-- A well-known favourite (e.g. Brazil vs Serbia in group stage) should be 75-85%
 
 Respond ONLY with valid JSON:
 {
@@ -143,7 +137,6 @@ def fetch_test_markets(n: int = 12) -> list[dict]:
         if len(yes_markets) >= target_each and len(no_markets) >= target_each:
             break
 
-    # Interleave for a balanced set
     result = []
     for pair in zip(yes_markets[:target_each], no_markets[:target_each]):
         result.extend(pair)
@@ -170,7 +163,6 @@ def build_payload(model: str, question: str, description: str, end_date: str) ->
         "response_format": {"type": "json_object"},
     }
 
-    # Fix for qwen3: requires thinking disabled to use json_object
     if model in THINKING_MODELS:
         payload["thinking"] = {"type": "disabled"}
 
@@ -200,12 +192,11 @@ def query_model(model: str, question: str, description: str, end_date: str, api_
                 except Exception:
                     err_msg = resp.text[:150]
                 logger.warning(f"    400 Bad Request: {err_msg}")
-                return None  # Not retryable
+                return None
 
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
 
-            # Strip markdown fences
             text = content.strip()
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
@@ -274,11 +265,9 @@ def analyze_model(model: str, markets: list[dict], api_key: str, delay: float) -
         s.all_probs.append(prob)
         s.n += 1
 
-        # Directional accuracy
         if (prob > 0.50) == (m["outcome"] == "YES"):
             correct_dir += 1
 
-        # Bet threshold: 60%/40%
         if prob > 0.60:
             direction = "YES"
             bets += 1
@@ -367,8 +356,8 @@ def print_report(all_stats: list[ModelStats]):
     print(f"  🏆 Best: {best.model}  (Brier={best.brier:.4f}, P-Std={best.prob_std:.3f})")
     print(f"\n  Next steps:")
     print(f"  1. Add to .env:  GROQ_MODEL={best.model}")
-    print(f"  2. Full backtest (uses ~200 RPD):")
-    print(f"     python backtest_honest.py --markets 200")
+    print(f"  2. Full backtest:")
+    print(f"     python backtests/backtest_2.py --markets 200")
     print("═" * 86 + "\n")
 
 

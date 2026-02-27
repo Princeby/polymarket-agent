@@ -7,36 +7,42 @@ model's edge before live trading.
 
 Features:
 - --days filter: only test markets resolved in the last N days
-- --exclude-categories: skip specific categories (e.g. "Crypto Price")
+- --exclude-categories: skip specific categories
 - --list-categories: print all valid category names
 - Categorization (Politics, Weather, Crypto Token, etc.)
 - Pagination to bypass API limits
 - Simulated execution slippage penalty
 - Strict success thresholds per category
 
-Usage:
-    python backtest_2.py --days 7 --markets 100
-    python backtest_2.py --days 7 --exclude-categories "Crypto Price"
-    python backtest_2.py --days 30 --min-volume 50000 --exclude-categories "Crypto Price" "Esports"
-    python backtest_2.py --list-categories
+Usage (run from project root OR backtests/ folder):
+    python backtests/backtest_2.py --days 7 --markets 100
+    python backtests/backtest_2.py --days 7 --exclude-categories "Crypto Price"
+    python backtests/backtest_2.py --list-categories
 """
 
 import argparse
 import json
 import logging
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
+# ── Path fix: works whether run from root or from backtests/ ──────────────────
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+load_dotenv(_ROOT / ".env")
+# ─────────────────────────────────────────────────────────────────────────────
+
 from src.agent import get_backend, analyze_market
 from src.market import Market
 from src.trader import kelly_stake
-
-load_dotenv()
 
 for lib in ["urllib3", "requests", "primp", "h2", "rustls", "hyper_util", "cookie_store", "ddgs"]:
     logging.getLogger(lib).setLevel(logging.WARNING)
@@ -78,7 +84,6 @@ class StrictBacktestResult:
 
 
 def categorize(q: str) -> str:
-    """Categorize market based on question content."""
     q = q.lower()
     if any(w in q for w in ["bitcoin", "btc", "ethereum", "eth", "xrp", "solana", "crypto"]):
         return "Crypto Price"
@@ -113,11 +118,6 @@ def fetch_dataset(
     max_days_old: int = None,
     exclude_categories: set = None,
 ) -> list[dict]:
-    """
-    Paginate through Polymarket API to build a test set.
-    Applies recency filter and category exclusions at fetch time
-    so excluded markets don't count against target_count.
-    """
     exclude_categories = exclude_categories or set()
     recency_label = f"last {max_days_old} day(s)" if max_days_old else "all time"
 
@@ -180,7 +180,6 @@ def fetch_dataset(
             if len(q) < 15:
                 continue
 
-            # ── Recency filter ─────────────────────────────────────────────
             if cutoff_dt is not None:
                 end_date_str = m.get("endDateIso") or m.get("endDate", "")
                 if not end_date_str:
@@ -197,7 +196,6 @@ def fetch_dataset(
                     skipped_recency += 1
                     continue
 
-            # ── Category exclusion ─────────────────────────────────────────
             category = categorize(q)
             if category in exclude_categories:
                 skipped_category += 1
@@ -226,7 +224,6 @@ def fetch_dataset(
             f"recency_skip={skipped_recency} | cat_skip={skipped_category}"
         )
 
-        # Stop paginating if recency filter yields nothing new
         if cutoff_dt is not None and found_this_page == 0 and pages_fetched > 1:
             logger.info("No recent markets on this page — stopping pagination.")
             break
@@ -250,7 +247,6 @@ def run_backtest_market(
     edge_threshold: float,
     slippage: float,
 ) -> StrictBacktestResult | None:
-    """Analyze one resolved market and compute simulated P&L."""
     market = Market(
         id=market_data["id"],
         question=market_data["question"],
@@ -348,7 +344,6 @@ def print_report(
             f"{r.category:<14}  {r.question[:42]}"
         )
 
-    # ── Overall metrics ────────────────────────────────────────────────────
     bets  = [r for r in results if r.direction != "SKIP"]
     wins  = [r for r in bets if r.won]
     skips = [r for r in results if r.direction == "SKIP"]
@@ -381,7 +376,6 @@ def print_report(
     else:
         print("🚨 Poor — no better than random")
 
-    # ── Category breakdown ─────────────────────────────────────────────────
     print(f"\n  CATEGORY BREAKDOWN")
     print(f"  {'Category':<16} {'N':>4} {'Bets':>5} {'Win%':>6} {'P&L':>9} {'Brier':>7}  Verdict")
     print("  " + "─" * 72)
@@ -418,7 +412,6 @@ def print_report(
             f"${c['pnl']:>7.2f} {c_brier:>7.3f}  {verdict}"
         )
 
-    # ── Final verdict ──────────────────────────────────────────────────────
     print(f"\n{'═' * 72}")
     if brier < 0.18 and roi > 0 and win_pct >= 55:
         print("  ✅ GREEN LIGHT — Model is calibrated and profitable.")
@@ -438,52 +431,34 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Category names (for --exclude-categories):
-  {chr(10).join('  ' + c for c in ALL_CATEGORIES)}
+{chr(10).join('  ' + c for c in ALL_CATEGORIES)}
 
 Examples:
-  # Exclude noisy short-window crypto markets (recommended)
-  python backtest_2.py --days 7 --exclude-categories "Crypto Price"
-
-  # Focus on high-signal markets only
-  python backtest_2.py --days 30 --min-volume 50000 \\
-      --exclude-categories "Crypto Price" "Esports" "Speech/Social"
-
-  # See all available categories
-  python backtest_2.py --list-categories
+  python backtests/backtest_2.py --days 7 --exclude-categories "Crypto Price"
+  python backtests/backtest_2.py --days 30 --min-volume 50000 \\
+      --exclude-categories "Crypto Price" "Esports"
+  python backtests/backtest_2.py --list-categories
         """
     )
-    parser.add_argument("--days",           type=int,   default=7,
-                        help="Only test markets resolved in last N days (default: 7)")
-    parser.add_argument("--markets",        type=int,   default=100,
-                        help="Max markets to fetch (default: 100)")
-    parser.add_argument("--min-volume",     type=float, default=5000,
-                        help="Minimum volume filter (default: $5,000)")
-    parser.add_argument("--slippage",       type=float, default=0.02,
-                        help="Slippage penalty (default: 0.02 = 2%%)")
-    parser.add_argument("--edge-threshold", type=float, default=0.08,
-                        help="Min edge over slippage to bet (default: 8%%)")
-    parser.add_argument("--bankroll",       type=float, default=1000,
-                        help="Simulated bankroll for Kelly sizing (default: $1000)")
-    parser.add_argument("--no-days",        action="store_true",
-                        help="Disable recency filter (fetch all time)")
-    parser.add_argument(
-        "--exclude-categories", nargs="+", metavar="CATEGORY", default=[],
-        help='Categories to skip. e.g. --exclude-categories "Crypto Price" "Esports"'
-    )
-    parser.add_argument("--list-categories", action="store_true",
-                        help="Print all valid category names and exit")
+    parser.add_argument("--days",           type=int,   default=7)
+    parser.add_argument("--markets",        type=int,   default=100)
+    parser.add_argument("--min-volume",     type=float, default=5000)
+    parser.add_argument("--slippage",       type=float, default=0.02)
+    parser.add_argument("--edge-threshold", type=float, default=0.08)
+    parser.add_argument("--bankroll",       type=float, default=1000)
+    parser.add_argument("--no-days",        action="store_true")
+    parser.add_argument("--exclude-categories", nargs="+", metavar="CATEGORY", default=[])
+    parser.add_argument("--list-categories",    action="store_true")
     args = parser.parse_args()
 
-    # ── --list-categories ──────────────────────────────────────────────────
     if args.list_categories:
         print("\n📋 Valid category names for --exclude-categories:\n")
         for cat in ALL_CATEGORIES:
             print(f'  "{cat}"')
         print(f'\nExample:')
-        print(f'  python backtest_2.py --exclude-categories "Crypto Price" "Esports"\n')
+        print(f'  python backtests/backtest_2.py --exclude-categories "Crypto Price" "Esports"\n')
         return
 
-    # ── Validate ───────────────────────────────────────────────────────────
     excluded = set(args.exclude_categories)
     invalid  = excluded - set(ALL_CATEGORIES)
     if invalid:

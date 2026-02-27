@@ -8,11 +8,10 @@ the LLM WITHOUT news context (to avoid data leakage), and measures:
   - Win/loss rate
   - Calibration by probability bucket
 
-Usage:
-    python backtest.py                    # Default: 30 resolved markets
-    python backtest.py --markets 50       # Test on 50 markets
-    python backtest.py --min-volume 50000 # Only high-volume markets
-    python backtest.py --category politics # Filter to a category
+Usage (run from project root OR backtests/ folder):
+    python backtests/backtest.py                    # Default: 30 resolved markets
+    python backtests/backtest.py --markets 50
+    python backtests/backtest.py --min-volume 50000
 """
 
 import argparse
@@ -27,11 +26,16 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+# ── Path fix: works whether run from root or from backtests/ ──────────────────
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+load_dotenv(_ROOT / ".env")
+# ─────────────────────────────────────────────────────────────────────────────
+
 from src.agent import get_backend, analyze_market, calculate_edge
 from src.market import Market
 from src.trader import kelly_stake
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,13 +52,12 @@ logger = logging.getLogger(__name__)
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 
 # ── Junk market patterns to exclude from backtesting ──────────────────────────
-# These are markets the model has no edge on (pure coin flips or sports spreads)
 JUNK_PATTERNS = [
-    "up or down",           # 5-minute crypto candles — pure noise
-    "spread:",              # sports point spreads
-    "o/u ",                 # over/under totals
+    "up or down",
+    "spread:",
+    "o/u ",
     ": o/u ",
-    "vs.",                  # generic team matchup (no context for model)
+    "vs.",
 ]
 
 JUNK_EXACT_PREFIXES = [
@@ -63,7 +66,6 @@ JUNK_EXACT_PREFIXES = [
 
 
 def is_junk_market(question: str) -> bool:
-    """Return True if this market is noise the model can't edge on."""
     q = question.lower().strip()
     for pattern in JUNK_PATTERNS:
         if pattern in q:
@@ -79,11 +81,11 @@ class BacktestResult:
     market_id: str
     question: str
     category: str
-    actual_outcome: str        # "YES" or "NO"
-    model_probability: float   # model's P(YES)
+    actual_outcome: str
+    model_probability: float
     market_price_at_close: float
     edge: float
-    direction: str             # "YES", "NO", or "SKIP"
+    direction: str
     stake: float
     won: bool
     pnl: float
@@ -105,7 +107,7 @@ def fetch_resolved_markets(
     url = f"{GAMMA_API_BASE}/markets"
     fetched = []
     offset = 0
-    batch = 100  # fetch in larger batches since we filter heavily
+    batch = 100
 
     while len(fetched) < limit:
         params = {
@@ -135,19 +137,12 @@ def fetch_resolved_markets(
             vol = float(m.get("volume", 0))
             q = m.get("question", "")
 
-            # Must have snapped to a clear outcome
             if 0.05 < yes_price < 0.95:
                 continue
-
-            # Volume filter
             if vol < min_volume:
                 continue
-
-            # Skip trivially short questions
             if len(q) < 15:
                 continue
-
-            # ── KEY FILTER: skip junk markets ─────────────────────────────
             if is_junk_market(q):
                 logger.debug(f"Filtered junk: {q[:60]}")
                 continue
@@ -166,7 +161,7 @@ def fetch_resolved_markets(
                 break
 
         offset += batch
-        if offset > 2000:  # safety cap
+        if offset > 2000:
             break
 
     logger.info(f"Found {len(fetched)} resolved markets for backtesting")
@@ -179,15 +174,11 @@ def backtest_market(
     bankroll: float,
     edge_threshold: float,
 ) -> BacktestResult | None:
-    """
-    Run a single resolved market through the model WITHOUT news.
-    Market price is hidden (set to 0.50) so the model must reason independently.
-    """
     market = Market(
         id=market_data["id"],
         question=market_data["question"],
         description=market_data["description"],
-        yes_price=0.50,   # hide actual price to prevent leakage
+        yes_price=0.50,
         no_price=0.50,
         volume=market_data["volume"],
         liquidity=0,
@@ -202,9 +193,7 @@ def backtest_market(
 
     model_prob = analysis.estimated_probability
     actual_outcome = market_data["outcome"]
-    actual_value = 1.0 if actual_outcome == "YES" else 0.0
 
-    # Bet direction vs hidden 50/50 baseline
     if model_prob > 0.50 + edge_threshold:
         direction = "YES"
         edge = model_prob - 0.50
@@ -231,7 +220,7 @@ def backtest_market(
                 actual_outcome == "YES" if direction == "YES"
                 else actual_outcome == "NO"
             )
-            pnl = stake if won else -stake  # 50/50 pays 2x
+            pnl = stake if won else -stake
 
     return BacktestResult(
         market_id=market_data["id"],
@@ -249,7 +238,6 @@ def backtest_market(
 
 
 def print_results(results: list[BacktestResult]):
-    """Print detailed backtest results."""
     print()
     print("╔══════════════════════════════════════════════════════════════════╗")
     print("║               🧪 Backtest Results                               ║")
@@ -360,14 +348,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Backtest model against resolved Polymarket data"
     )
-    parser.add_argument("--markets", type=int, default=30,
-                        help="Number of resolved markets to test")
-    parser.add_argument("--min-volume", type=float, default=50000,
-                        help="Minimum volume filter")
-    parser.add_argument("--edge-threshold", type=float, default=0.08,
-                        help="Min edge to place bet (default 8%%)")
-    parser.add_argument("--bankroll", type=float, default=100,
-                        help="Simulated bankroll")
+    parser.add_argument("--markets",        type=int,   default=30,    help="Number of resolved markets to test")
+    parser.add_argument("--min-volume",     type=float, default=50000, help="Minimum volume filter")
+    parser.add_argument("--edge-threshold", type=float, default=0.08,  help="Min edge to place bet (default 8%%)")
+    parser.add_argument("--bankroll",       type=float, default=100,   help="Simulated bankroll")
     args = parser.parse_args()
 
     try:
@@ -388,8 +372,6 @@ def main():
 
     print(f"\n🧪 Backtesting {len(resolved)} markets (news DISABLED)...")
     print(f"   Backend:   {backend.name}")
-    print(f"   News:      DISABLED")
-    print(f"   Junk:      FILTERED (coin-flips, spreads, O/U removed)")
     print(f"   Threshold: {args.edge_threshold:.0%}")
     print(f"   Bankroll:  ${args.bankroll:.0f}")
 
@@ -411,13 +393,14 @@ def main():
         else:
             logger.warning("  ⚠ Analysis failed — skipping")
 
-        time.sleep(1.5)  # Groq rate limit
+        time.sleep(1.5)
 
     if not results:
         print("All analyses failed. Check your API key.")
         return
 
-    output_path = Path(__file__).parent / "data" / "backtest_results.json"
+    output_path = _ROOT / "data" / "backtest_results.json"
+    output_path.parent.mkdir(exist_ok=True)
     output_path.write_text(json.dumps([asdict(r) for r in results], indent=2))
     logger.info(f"Results saved to {output_path}")
 
