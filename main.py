@@ -2,12 +2,6 @@
 Polymarket Prediction Market Trading Agent
 Main entry point — orchestrates the full agent loop.
 
-Changes from v2:
-  - REMOVED requires_high_confidence gate: medium confidence bets are now allowed.
-    Rationale: the model almost never returns "high" confidence, causing near-zero
-    trade frequency on live markets. Backtest showed medium confidence is profitable.
-  - Low-confidence bets still always skipped.
-  - Added --strict flag to re-enable the old high-confidence-only behaviour if needed.
 
 Usage:
     python main.py                        # Continuous loop, dry run

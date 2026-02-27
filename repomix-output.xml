@@ -58,6 +58,7 @@ src/
 .gitignore
 backtest_2.py
 backtest.py
+derive_creds.py
 main.py
 report.py
 requirements.txt
@@ -66,6 +67,64 @@ resolve.py
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="derive_creds.py">
+"""
+derive_creds.py
+───────────────
+Run this ONCE to derive your Polymarket API credentials from your wallet
+private key. No trade is placed. Copy the printed values into your .env file.
+
+Usage:
+    python derive_creds.py
+"""
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
+
+if not private_key:
+    print("\n❌  POLYMARKET_PRIVATE_KEY is not set in your .env file.")
+    print("    Add it and re-run:\n")
+    print("    POLYMARKET_PRIVATE_KEY=your_private_key_here\n")
+    exit(1)
+
+print("\n🔑  Deriving Polymarket API credentials from your private key...")
+print("    (This talks to Polymarket's CLOB server — no funds are moved)\n")
+
+try:
+    from py_clob_client.client import ClobClient
+
+    client = ClobClient(
+        host="https://clob.polymarket.com",
+        key=private_key,
+        chain_id=137,  # Polygon mainnet
+    )
+
+    creds = client.derive_api_key()
+
+    print("✅  Success! Copy these three lines into your .env file:\n")
+    print("─" * 55)
+    print(f"POLYMARKET_API_KEY={creds.api_key}")
+    print(f"POLYMARKET_API_SECRET={creds.api_secret}")
+    print(f"POLYMARKET_API_PASSPHRASE={creds.api_passphrase}")
+    print("─" * 55)
+    print("\n⚠️   Keep these secret — treat them like passwords.")
+    print("    Never commit your .env to git.\n")
+
+except ImportError:
+    print("❌  py-clob-client is not installed. Run:\n")
+    print("    pip install py-clob-client\n")
+except Exception as e:
+    print(f"❌  Derivation failed: {e}")
+    print("\n    Common causes:")
+    print("    • Private key is wrong or has extra spaces/characters")
+    print("    • Your wallet hasn't interacted with Polymarket yet")
+    print("      → Deposit through polymarket.com first, then retry\n")
+</file>
 
 <file path="prompts/trading_prompt.txt">
 You are an expert prediction market analyst and superforecaster.
@@ -194,234 +253,6 @@ esac
 
 <file path="src/__init__.py">
 # Polymarket Trading Agent
-</file>
-
-<file path="src/env.example">
-# ─────────────────────────────────────────────
-#  Polymarket Agent — Environment Configuration
-# ─────────────────────────────────────────────
-
-# ── Backend Selection ─────────────────────────
-# Choose one: groq | openai | ollama
-LLM_BACKEND=openai
-
-# ── OpenAI ────────────────────────────────────
-# Get your key at: https://platform.openai.com/api-keys
-OPENAI_API_KEY=sk-...
-
-# Model options (best → cheapest):
-#   gpt-4o            — Best reasoning, higher cost (~$5/1M input tokens)
-#   gpt-4o-mini       — Great balance, very cheap (~$0.15/1M input tokens)  ← recommended
-#   gpt-4-turbo       — Strong, moderate cost
-#   gpt-3.5-turbo     — Fast and cheap, weaker reasoning
-#   o3-mini           — Deep reasoning (slower, no temperature control)
-#   o4-mini           — Latest reasoning model
-OPENAI_MODEL=gpt-4o-mini
-
-# Optional: Override for Azure OpenAI or a custom proxy
-# OPENAI_BASE_URL=https://your-resource.openai.azure.com/openai/deployments/your-deployment/chat/completions?api-version=2024-02-01
-
-# ── Groq (alternative) ────────────────────────
-# Get your key at: https://console.groq.com
-# GROQ_API_KEY=gsk_...
-# GROQ_MODEL=llama-3.3-70b-versatile
-
-# ── Ollama (local, alternative) ───────────────
-# OLLAMA_URL=http://localhost:11434
-# OLLAMA_MODEL=qwen3:8b
-
-# ── Agent Settings ────────────────────────────
-DRY_RUN=true
-BANKROLL=100
-SCAN_INTERVAL_SECONDS=300
-MIN_VOLUME=10000
-MIN_LIQUIDITY=1000
-MIN_EDGE_THRESHOLD=0.08
-
-# ── Polymarket (for live trading only) ────────
-# POLYMARKET_API_KEY=your_key_here
-</file>
-
-<file path="src/market.py">
-"""
-Polymarket Gamma API Client
-Fetches and filters active prediction markets from Polymarket's public API.
-No authentication required for read operations.
-"""
-
-import json
-import logging
-import requests
-from dataclasses import dataclass
-from typing import Optional
-
-logger = logging.getLogger(__name__)
-
-GAMMA_API_BASE = "https://gamma-api.polymarket.com"
-
-
-@dataclass
-class Market:
-    """Parsed prediction market data."""
-    id: str
-    question: str
-    description: str
-    yes_price: float
-    no_price: float
-    volume: float
-    liquidity: float
-    end_date: str
-    active: bool
-    slug: str
-
-    @property
-    def implied_probability(self) -> float:
-        """Market-implied probability of YES outcome."""
-        return self.yes_price
-
-    def __str__(self) -> str:
-        return (
-            f"[{self.id}] {self.question[:80]}\n"
-            f"  YES: {self.yes_price:.1%} | NO: {self.no_price:.1%} | "
-            f"Vol: ${self.volume:,.0f} | Liq: ${self.liquidity:,.0f} | "
-            f"Ends: {self.end_date}"
-        )
-
-
-def _parse_market(raw: dict) -> Optional[Market]:
-    """Parse a raw API response into a Market dataclass."""
-    try:
-        # outcomePrices is a JSON string like '["0.62", "0.38"]'
-        prices = json.loads(raw.get("outcomePrices", "[]"))
-        if len(prices) < 2:
-            return None
-
-        return Market(
-            id=raw.get("id", ""),
-            question=raw.get("question", ""),
-            description=raw.get("description", "")[:500],  # truncate long descriptions
-            yes_price=float(prices[0]),
-            no_price=float(prices[1]),
-            volume=float(raw.get("volumeNum", raw.get("volume", 0))),
-            liquidity=float(raw.get("liquidityNum", raw.get("liquidity", 0))),
-            end_date=raw.get("endDateIso", raw.get("endDate", "")),
-            active=raw.get("active", False),
-            slug=raw.get("slug", ""),
-        )
-    except (json.JSONDecodeError, ValueError, TypeError) as e:
-        logger.warning(f"Failed to parse market: {e}")
-        return None
-
-
-def get_active_markets(
-    limit: int = 20,
-    min_volume: float = 10000,
-    min_liquidity: float = 1000,
-) -> list[Market]:
-    """
-    Fetch active, open markets from Polymarket sorted by volume.
-
-    Args:
-        limit: Maximum number of markets to fetch from the API.
-        min_volume: Minimum total volume (USD) to include a market.
-        min_liquidity: Minimum current liquidity (USD) to include a market.
-
-    Returns:
-        List of Market objects that pass the filters.
-    """
-    url = f"{GAMMA_API_BASE}/markets"
-    params = {
-        "active": "true",
-        "closed": "false",
-        "limit": limit,
-        "order": "volume",
-        "ascending": "false",
-    }
-
-    try:
-        response = requests.get(url, params=params, timeout=15)
-        response.raise_for_status()
-        raw_markets = response.json()
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch markets: {e}")
-        return []
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"Failed to parse API response: {e}")
-        return []
-
-    markets = []
-    for raw in raw_markets:
-        market = _parse_market(raw)
-        if market is None:
-            continue
-        if not market.active:
-            continue
-        if market.volume < min_volume:
-            continue
-        if market.liquidity < min_liquidity:
-            continue
-        # Skip markets with extreme prices (already resolved or near-certain)
-        if market.yes_price < 0.03 or market.yes_price > 0.97:
-            continue
-        # Skip sports spreads and O/U — model has no edge (50% win rate in backtest)
-        q = market.question.lower()
-        if q.startswith("spread:") or "o/u " in q or ": o/u " in q:
-            logger.debug(f"Skipping sports spread: {market.question[:50]}")
-            continue
-        markets.append(market)
-
-    logger.info(f"Fetched {len(markets)} markets (from {len(raw_markets)} raw)")
-    return markets
-
-
-def get_market_by_id(market_id: str) -> Optional[Market]:
-    """Fetch a single market by its ID."""
-    url = f"{GAMMA_API_BASE}/markets/{market_id}"
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        return _parse_market(response.json())
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch market {market_id}: {e}")
-        return None
-
-
-def format_market_for_llm(market: Market, include_news: bool = True) -> str:
-    """
-    Format market data into a clean text block for the LLM prompt.
-    Optionally includes recent news headlines for real-time context.
-    """
-    base = (
-        f"Market Question: {market.question}\n"
-        f"Current YES Price: {market.yes_price:.4f} "
-        f"(implies {market.yes_price:.1%} probability of YES)\n"
-        f"Current NO Price: {market.no_price:.4f}\n"
-        f"Total Volume Traded: ${market.volume:,.0f}\n"
-        f"Current Liquidity: ${market.liquidity:,.0f}\n"
-        f"Resolution Date: {market.end_date}\n"
-        f"Description: {market.description}"
-    )
-
-    if include_news:
-        try:
-            from src.news import fetch_news_context
-            news = fetch_news_context(market.question, max_results=3)
-            if news:
-                base += f"\n\n--- Recent News Context ---\n{news}"
-        except Exception as e:
-            logger.debug(f"News fetch skipped: {e}")
-
-    return base
-
-
-if __name__ == "__main__":
-    # Quick smoke test
-    logging.basicConfig(level=logging.INFO)
-    markets = get_active_markets(limit=5, min_volume=5000, min_liquidity=500)
-    for m in markets:
-        print(m)
-        print(format_market_for_llm(m))
-        print("---")
 </file>
 
 <file path="src/model_compare.py">
@@ -838,6 +669,501 @@ if __name__ == "__main__":
     main()
 </file>
 
+<file path=".gitignore">
+# Environment & secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Trade data (contains your decisions)
+data/
+
+# OS files
+.DS_Store
+</file>
+
+<file path="report.py">
+#!/usr/bin/env python3
+"""
+Weekly Performance Report
+─────────────────────────
+Breaks down agent performance by week: bets placed, stakes,
+model accuracy, P&L simulation, and trend analysis.
+
+Usage:
+    python report.py            # Full weekly breakdown
+    python report.py --weeks 4  # Last 4 weeks only
+"""
+
+import argparse
+import json
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATA_DIR = Path(__file__).parent / "data"
+TRADE_LOG = DATA_DIR / "trade_history.json"
+
+
+def load_log() -> list[dict]:
+    try:
+        return json.loads(TRADE_LOG.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def week_key(timestamp_str: str) -> str:
+    """Convert an ISO timestamp to a 'YYYY-WXX' week label."""
+    dt = datetime.fromisoformat(timestamp_str)
+    year, week, _ = dt.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def week_start_date(week_str: str) -> str:
+    """Convert 'YYYY-WXX' back to the Monday date for display."""
+    year, w = week_str.split("-W")
+    dt = datetime.strptime(f"{year} {w} 1", "%G %V %u")
+    return dt.strftime("%b %d")
+
+
+def compute_weekly_stats(log: list[dict]) -> dict:
+    """Group trade log entries by week and compute stats."""
+    weeks = defaultdict(lambda: {
+        "decisions": 0,
+        "bets": [],
+        "skips": 0,
+        "failures": 0,
+        "total_stake": 0.0,
+        "edges": [],
+        "probabilities": [],
+        "resolved": [],
+        "directions": {"YES": 0, "NO": 0},
+    })
+
+    for entry in log:
+        ts = entry.get("timestamp", "")
+        if not ts:
+            continue
+        wk = week_key(ts)
+        w = weeks[wk]
+        w["decisions"] += 1
+
+        action = entry.get("action_taken", "")
+        stake = entry.get("stake_usd", 0)
+
+        if "BET" in action:
+            w["bets"].append(entry)
+            w["total_stake"] += stake
+            direction = entry.get("edge_direction", "")
+            if direction in w["directions"]:
+                w["directions"][direction] += 1
+            if "abs_edge" in entry:
+                w["edges"].append(entry["abs_edge"])
+            if "model_probability" in entry:
+                w["probabilities"].append(entry["model_probability"])
+        elif "SKIP" in action:
+            w["skips"] += 1
+        elif "FAIL" in action:
+            w["failures"] += 1
+
+        # Track resolved outcomes
+        if "outcome_value" in entry and "model_probability" in entry:
+            w["resolved"].append({
+                "forecast": entry["model_probability"],
+                "actual": entry["outcome_value"],
+                "stake": stake,
+                "direction": entry.get("edge_direction", ""),
+                "market_price": entry.get("market_yes_price", 0.5),
+            })
+
+    return dict(sorted(weeks.items()))
+
+
+def simulate_pnl(resolved: list[dict]) -> dict:
+    """
+    Simulate P&L on resolved bets.
+    YES bet wins if outcome=1, NO bet wins if outcome=0.
+    Payout is (1/price_paid) * stake if win, lose stake if loss.
+    """
+    if not resolved:
+        return {"wins": 0, "losses": 0, "pnl": 0.0, "roi": 0.0}
+
+    wins = losses = 0
+    total_pnl = 0.0
+    total_staked = 0.0
+
+    for r in resolved:
+        stake = r["stake"]
+        direction = r["direction"]
+        actual = r["actual"]
+        market_price = r["market_price"]
+
+        if stake <= 0:
+            continue
+
+        total_staked += stake
+
+        if direction == "YES":
+            cost = market_price
+            won = actual == 1.0
+        else:
+            cost = 1 - market_price
+            won = actual == 0.0
+
+        if won:
+            profit = stake * (1 / cost - 1)  # payout minus cost
+            total_pnl += profit
+            wins += 1
+        else:
+            total_pnl -= stake
+            losses += 1
+
+    roi = (total_pnl / total_staked * 100) if total_staked > 0 else 0
+    return {"wins": wins, "losses": losses, "pnl": round(total_pnl, 2), "roi": round(roi, 1)}
+
+
+def brier_score(resolved: list[dict]) -> float | None:
+    if not resolved:
+        return None
+    total = sum((r["forecast"] - r["actual"]) ** 2 for r in resolved)
+    return round(total / len(resolved), 4)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Weekly performance report")
+    parser.add_argument("--weeks", type=int, default=0, help="Show only last N weeks (0=all)")
+    args = parser.parse_args()
+
+    log = load_log()
+    if not log:
+        print("No trade history found. Run the agent first!")
+        return
+
+    weekly = compute_weekly_stats(log)
+
+    if args.weeks > 0:
+        keys = list(weekly.keys())[-args.weeks:]
+        weekly = {k: weekly[k] for k in keys}
+
+    # ── Header ───────────────────────────────────────────────────────────
+    print()
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║              📊 Weekly Performance Report                   ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+
+    # ── Weekly Table ─────────────────────────────────────────────────────
+    print(f"\n  {'Week':<10} {'Start':<8} {'Bets':<6} {'Skip':<6} {'Staked':>8} "
+          f"{'Avg Edge':>9} {'YES/NO':<8} {'Brier':>7} {'P&L':>8}")
+    print(f"  {'─'*72}")
+
+    totals = {"bets": 0, "skips": 0, "stake": 0.0, "edges": [], "resolved": [], "decisions": 0}
+
+    for wk, stats in weekly.items():
+        n_bets = len(stats["bets"])
+        avg_edge = sum(stats["edges"]) / len(stats["edges"]) if stats["edges"] else 0
+        brier = brier_score(stats["resolved"])
+        pnl_data = simulate_pnl(stats["resolved"])
+        yes_no = f"{stats['directions']['YES']}/{stats['directions']['NO']}"
+        start = week_start_date(wk)
+
+        brier_str = f"{brier:.3f}" if brier is not None else "  —"
+        pnl_str = f"${pnl_data['pnl']:+.2f}" if stats["resolved"] else "  —"
+
+        print(f"  {wk:<10} {start:<8} {n_bets:<6} {stats['skips']:<6} "
+              f"${stats['total_stake']:>7.2f} {avg_edge:>8.1%} {yes_no:<8} "
+              f"{brier_str:>7} {pnl_str:>8}")
+
+        totals["bets"] += n_bets
+        totals["skips"] += stats["skips"]
+        totals["stake"] += stats["total_stake"]
+        totals["edges"].extend(stats["edges"])
+        totals["resolved"].extend(stats["resolved"])
+        totals["decisions"] += stats["decisions"]
+
+    # ── Totals ───────────────────────────────────────────────────────────
+    print(f"  {'─'*72}")
+    total_avg_edge = sum(totals["edges"]) / len(totals["edges"]) if totals["edges"] else 0
+    total_brier = brier_score(totals["resolved"])
+    total_pnl = simulate_pnl(totals["resolved"])
+    brier_str = f"{total_brier:.3f}" if total_brier is not None else "  —"
+    pnl_str = f"${total_pnl['pnl']:+.2f}" if totals["resolved"] else "  —"
+
+    print(f"  {'TOTAL':<10} {'':8} {totals['bets']:<6} {totals['skips']:<6} "
+          f"${totals['stake']:>7.2f} {total_avg_edge:>8.1%} {'':8} "
+          f"{brier_str:>7} {pnl_str:>8}")
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    print(f"\n{'─'*64}")
+    print(f"  Total decisions:  {totals['decisions']}")
+    print(f"  Total bets:       {totals['bets']}")
+    print(f"  Total staked:     ${totals['stake']:.2f}")
+    print(f"  Avg edge/bet:     {total_avg_edge:.1%}")
+
+    if totals["resolved"]:
+        print(f"\n  ── Resolved Bets ──")
+        print(f"  Win/Loss:         {total_pnl['wins']}W / {total_pnl['losses']}L")
+        print(f"  Net P&L:          ${total_pnl['pnl']:+.2f}")
+        print(f"  ROI:              {total_pnl['roi']:+.1f}%")
+        print(f"  Brier Score:      {total_brier:.4f}")
+
+        if total_brier < 0.10:
+            print(f"  Verdict:          🏆 Excellent — beating the market")
+        elif total_brier < 0.20:
+            print(f"  Verdict:          👍 Good signal — consider live trading")
+        elif total_brier < 0.26:
+            print(f"  Verdict:          ⚠️  Baseline — no better than market")
+        else:
+            print(f"  Verdict:          🚨 Poor — needs rework")
+    else:
+        print(f"\n  ⏳ No resolved bets yet. Markets need to expire first.")
+        print(f"     Run: python resolve.py")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="src/env.example">
+# ─────────────────────────────────────────────
+#  Polymarket Agent — Environment Configuration
+# ─────────────────────────────────────────────
+
+# ── Backend Selection ─────────────────────────
+LLM_BACKEND=groq
+
+# ── Groq ──────────────────────────────────────
+# Get your key at: https://console.groq.com
+GROQ_API_KEY=gsk_...
+
+# Set this to your finetuned model ID from the Groq console
+# (visible under "Fine-tuned Models" after upload completes)
+# e.g. GROQ_MODEL=ft:llama-3.3-70b-versatile:your-org:my-model:abc123
+GROQ_MODEL=ft:YOUR_FINETUNED_MODEL_ID_HERE
+
+# ── Agent Settings ────────────────────────────
+# Set DRY_RUN=false to place real orders on Polymarket
+DRY_RUN=false
+
+BANKROLL=100
+SCAN_INTERVAL_SECONDS=300
+MIN_VOLUME=10000
+MIN_LIQUIDITY=1000
+MIN_EDGE_THRESHOLD=0.08
+
+# ── Polymarket Live Trading ────────────────────
+# Your wallet's private key (hex, without 0x prefix).
+# This wallet must hold USDC on Polygon and have approved the Polymarket contract.
+# NEVER commit this to git.
+POLYMARKET_PRIVATE_KEY=your_wallet_private_key_here
+
+# API credentials — derived automatically from POLYMARKET_PRIVATE_KEY on first run.
+# After the first run, copy the logged values here to skip re-derivation.
+POLYMARKET_API_KEY=
+POLYMARKET_API_SECRET=
+POLYMARKET_API_PASSPHRASE=
+</file>
+
+<file path="src/market.py">
+"""
+Polymarket Gamma API Client
+Fetches and filters active prediction markets from Polymarket's public API.
+No authentication required for read operations.
+"""
+
+import json
+import logging
+import requests
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+
+
+@dataclass
+class Market:
+    """Parsed prediction market data."""
+    id: str
+    question: str
+    description: str
+    yes_price: float
+    no_price: float
+    volume: float
+    liquidity: float
+    end_date: str
+    active: bool
+    slug: str
+    clob_token_ids: list = field(default_factory=list)  # [yes_token_id, no_token_id]
+
+    @property
+    def implied_probability(self) -> float:
+        """Market-implied probability of YES outcome."""
+        return self.yes_price
+
+    def __str__(self) -> str:
+        return (
+            f"[{self.id}] {self.question[:80]}\n"
+            f"  YES: {self.yes_price:.1%} | NO: {self.no_price:.1%} | "
+            f"Vol: ${self.volume:,.0f} | Liq: ${self.liquidity:,.0f} | "
+            f"Ends: {self.end_date}"
+        )
+
+
+def _parse_market(raw: dict) -> Optional[Market]:
+    """Parse a raw API response into a Market dataclass."""
+    try:
+        # outcomePrices is a JSON string like '["0.62", "0.38"]'
+        prices = json.loads(raw.get("outcomePrices", "[]"))
+        if len(prices) < 2:
+            return None
+
+        # clobTokenIds is a JSON string like '["<yes_token>", "<no_token>"]'
+        raw_token_ids = raw.get("clobTokenIds", "[]")
+        try:
+            clob_token_ids = json.loads(raw_token_ids) if isinstance(raw_token_ids, str) else raw_token_ids
+        except (json.JSONDecodeError, TypeError):
+            clob_token_ids = []
+
+        return Market(
+            id=raw.get("id", ""),
+            question=raw.get("question", ""),
+            description=raw.get("description", "")[:500],  # truncate long descriptions
+            yes_price=float(prices[0]),
+            no_price=float(prices[1]),
+            volume=float(raw.get("volumeNum", raw.get("volume", 0))),
+            liquidity=float(raw.get("liquidityNum", raw.get("liquidity", 0))),
+            end_date=raw.get("endDateIso", raw.get("endDate", "")),
+            active=raw.get("active", False),
+            slug=raw.get("slug", ""),
+            clob_token_ids=clob_token_ids,
+        )
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        logger.warning(f"Failed to parse market: {e}")
+        return None
+
+
+def get_active_markets(
+    limit: int = 20,
+    min_volume: float = 10000,
+    min_liquidity: float = 1000,
+) -> list[Market]:
+    """
+    Fetch active, open markets from Polymarket sorted by volume.
+
+    Args:
+        limit: Maximum number of markets to fetch from the API.
+        min_volume: Minimum total volume (USD) to include a market.
+        min_liquidity: Minimum current liquidity (USD) to include a market.
+
+    Returns:
+        List of Market objects that pass the filters.
+    """
+    url = f"{GAMMA_API_BASE}/markets"
+    params = {
+        "active": "true",
+        "closed": "false",
+        "limit": limit,
+        "order": "volume",
+        "ascending": "false",
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        raw_markets = response.json()
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch markets: {e}")
+        return []
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.error(f"Failed to parse API response: {e}")
+        return []
+
+    markets = []
+    for raw in raw_markets:
+        market = _parse_market(raw)
+        if market is None:
+            continue
+        if not market.active:
+            continue
+        if market.volume < min_volume:
+            continue
+        if market.liquidity < min_liquidity:
+            continue
+        # Skip markets with extreme prices (already resolved or near-certain)
+        if market.yes_price < 0.03 or market.yes_price > 0.97:
+            continue
+        # Skip sports spreads and O/U — model has no edge (50% win rate in backtest)
+        q = market.question.lower()
+        if q.startswith("spread:") or "o/u " in q or ": o/u " in q:
+            logger.debug(f"Skipping sports spread: {market.question[:50]}")
+            continue
+        markets.append(market)
+
+    logger.info(f"Fetched {len(markets)} markets (from {len(raw_markets)} raw)")
+    return markets
+
+
+def get_market_by_id(market_id: str) -> Optional[Market]:
+    """Fetch a single market by its ID."""
+    url = f"{GAMMA_API_BASE}/markets/{market_id}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return _parse_market(response.json())
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch market {market_id}: {e}")
+        return None
+
+
+def format_market_for_llm(market: Market, include_news: bool = True) -> str:
+    """
+    Format market data into a clean text block for the LLM prompt.
+    Optionally includes recent news headlines for real-time context.
+    """
+    base = (
+        f"Market Question: {market.question}\n"
+        f"Current YES Price: {market.yes_price:.4f} "
+        f"(implies {market.yes_price:.1%} probability of YES)\n"
+        f"Current NO Price: {market.no_price:.4f}\n"
+        f"Total Volume Traded: ${market.volume:,.0f}\n"
+        f"Current Liquidity: ${market.liquidity:,.0f}\n"
+        f"Resolution Date: {market.end_date}\n"
+        f"Description: {market.description}"
+    )
+
+    if include_news:
+        try:
+            from src.news import fetch_news_context
+            news = fetch_news_context(market.question, max_results=3)
+            if news:
+                base += f"\n\n--- Recent News Context ---\n{news}"
+        except Exception as e:
+            logger.debug(f"News fetch skipped: {e}")
+
+    return base
+
+
+if __name__ == "__main__":
+    # Quick smoke test
+    logging.basicConfig(level=logging.INFO)
+    markets = get_active_markets(limit=5, min_volume=5000, min_liquidity=500)
+    for m in markets:
+        print(m)
+        print(format_market_for_llm(m))
+        print("---")
+</file>
+
 <file path="src/news.py">
 """
 News Search Module
@@ -1004,7 +1330,7 @@ if __name__ == "__main__":
 <file path="src/trader_two.py">
 """
 Trade Execution & Risk Management
-Position sizing (Kelly criterion), dry-run execution, trade logging,
+Position sizing (Kelly criterion), live/dry-run execution, trade logging,
 portfolio summary, and open position deduplication.
 """
 
@@ -1355,38 +1681,78 @@ def execute_trade(
         logger.info(msg)
         return f"DRY_RUN_BET_{direction}"
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # REAL EXECUTION — Uncomment when ready to trade with real money
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    #
-    # from py_clob_client.client import ClobClient
-    # from py_clob_client.clob_types import OrderArgs
-    #
-    # client = ClobClient(
-    #     host="https://clob.polymarket.com",
-    #     key=os.getenv("POLYMARKET_API_KEY"),
-    #     chain_id=137,  # Polygon mainnet
-    # )
-    #
-    # token_ids = json.loads(market.raw.get("clobTokenIds", "[]"))
-    # token_id = token_ids[0] if direction == "YES" else token_ids[1]
-    #
-    # order = client.create_order(
-    #     OrderArgs(
-    #         token_id=token_id,
-    #         price=market.yes_price if direction == "YES" else market.no_price,
-    #         size=stake / (market.yes_price if direction == "YES" else market.no_price),
-    #         side="BUY",
-    #     )
-    # )
-    # result = client.post_order(order)
-    # logger.info(f"Order placed: {result}")
-    # return f"LIVE_BET_{direction}"
-    #
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ── Live Execution ─────────────────────────────────────────────────────────
+    if not market.clob_token_ids or len(market.clob_token_ids) < 2:
+        logger.error(
+            f"No CLOB token IDs for market {market.id} — cannot place order. "
+            f"Market may not support CLOB trading."
+        )
+        return "FAILED_NO_TOKEN_IDS"
 
-    logger.warning("Live trading is not yet implemented. Set DRY_RUN=true.")
-    return "NOT_IMPLEMENTED"
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import OrderArgs, ApiCreds
+
+        private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+        api_key = os.getenv("POLYMARKET_API_KEY", "")
+        api_secret = os.getenv("POLYMARKET_API_SECRET", "")
+        api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+
+        if not private_key:
+            logger.error("POLYMARKET_PRIVATE_KEY not set in .env")
+            return "FAILED_NO_CREDENTIALS"
+
+        creds = None
+        if api_key and api_secret and api_passphrase:
+            creds = ApiCreds(
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+            )
+
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=private_key,
+            chain_id=137,  # Polygon mainnet
+            creds=creds,
+        )
+
+        # Derive API credentials on first run if not provided
+        if creds is None:
+            logger.info("No API credentials found — deriving from private key...")
+            derived = client.derive_api_key()
+            logger.info(
+                f"Derived creds (save these to .env to skip derivation next run):\n"
+                f"  POLYMARKET_API_KEY={derived.api_key}\n"
+                f"  POLYMARKET_API_SECRET={derived.api_secret}\n"
+                f"  POLYMARKET_API_PASSPHRASE={derived.api_passphrase}"
+            )
+
+        token_id = market.clob_token_ids[0] if direction == "YES" else market.clob_token_ids[1]
+        price = market.yes_price if direction == "YES" else market.no_price
+        size = round(stake / price, 4)  # number of contracts
+
+        order = client.create_order(
+            OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=size,
+                side="BUY",
+            )
+        )
+        result = client.post_order(order)
+        logger.info(
+            f"[LIVE] Order placed: {direction} {size:.4f} contracts @ {price:.4f} "
+            f"on '{market.question[:50]}...' | result={result}"
+        )
+        return f"LIVE_BET_{direction}"
+
+    except ImportError:
+        logger.error("py-clob-client not installed. Run: pip install py-clob-client")
+        return "FAILED_MISSING_PACKAGE"
+    except Exception as e:
+        logger.error(f"Order placement failed for market {market.id}: {e}", exc_info=True)
+        return f"FAILED_ORDER_ERROR"
 </file>
 
 <file path="src/trader.py">
@@ -1777,268 +2143,563 @@ def execute_trade(
     return "NOT_IMPLEMENTED"
 </file>
 
-<file path=".gitignore">
-# Environment & secrets
-.env
-
-# Python
-venv/
-__pycache__/
-*.pyc
-*.pyo
-
-# Trade data (contains your decisions)
-data/
-
-# OS files
-.DS_Store
-</file>
-
-<file path="report.py">
+<file path="backtest_2.py">
 #!/usr/bin/env python3
 """
-Weekly Performance Report
-─────────────────────────
-Breaks down agent performance by week: bets placed, stakes,
-model accuracy, P&L simulation, and trend analysis.
+Stringent Categorical Backtester (Phase 1-3)
+─────────────────────────────────────────────
+Fetches resolved markets from Polymarket to rigorously validate the
+model's edge before live trading.
+
+Features:
+- --days filter: only test markets resolved in the last N days
+- --exclude-categories: skip specific categories (e.g. "Crypto Price")
+- --list-categories: print all valid category names
+- Categorization (Politics, Weather, Crypto Token, etc.)
+- Pagination to bypass API limits
+- Simulated execution slippage penalty
+- Strict success thresholds per category
 
 Usage:
-    python report.py            # Full weekly breakdown
-    python report.py --weeks 4  # Last 4 weeks only
+    python backtest_2.py --days 7 --markets 100
+    python backtest_2.py --days 7 --exclude-categories "Crypto Price"
+    python backtest_2.py --days 30 --min-volume 50000 --exclude-categories "Crypto Price" "Esports"
+    python backtest_2.py --list-categories
 """
 
 import argparse
 import json
+import logging
+import time
 from collections import defaultdict
-from datetime import datetime, timezone
-from pathlib import Path
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
+import requests
 from dotenv import load_dotenv
+
+from src.agent import get_backend, analyze_market
+from src.market import Market
+from src.trader import kelly_stake
 
 load_dotenv()
 
-DATA_DIR = Path(__file__).parent / "data"
-TRADE_LOG = DATA_DIR / "trade_history.json"
+for lib in ["urllib3", "requests", "primp", "h2", "rustls", "hyper_util", "cookie_store", "ddgs"]:
+    logging.getLogger(lib).setLevel(logging.WARNING)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+
+ALL_CATEGORIES = [
+    "Crypto Price",
+    "Crypto Token",
+    "Politics/Geo",
+    "Sports",
+    "Esports",
+    "Weather",
+    "Speech/Social",
+    "Soccer/Tennis",
+    "Other",
+]
 
 
-def load_log() -> list[dict]:
-    try:
-        return json.loads(TRADE_LOG.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+@dataclass
+class StrictBacktestResult:
+    market_id: str
+    question: str
+    category: str
+    actual_outcome: str
+    model_probability: float
+    direction: str
+    stake: float
+    won: bool
+    pnl: float
+    end_date: str
 
 
-def week_key(timestamp_str: str) -> str:
-    """Convert an ISO timestamp to a 'YYYY-WXX' week label."""
-    dt = datetime.fromisoformat(timestamp_str)
-    year, week, _ = dt.isocalendar()
-    return f"{year}-W{week:02d}"
+def categorize(q: str) -> str:
+    """Categorize market based on question content."""
+    q = q.lower()
+    if any(w in q for w in ["bitcoin", "btc", "ethereum", "eth", "xrp", "solana", "crypto"]):
+        return "Crypto Price"
+    if any(w in q for w in ["fdv", "pump.fun", "superform", "aztec", "launch", "airdrop"]):
+        return "Crypto Token"
+    if any(w in q for w in ["trump", "pardon", "election", "democrat", "republican",
+                             "primary", "vote", "cabinet", "president", "congress",
+                             "nato", "israel", "saudi", "russia", "ukraine"]):
+        return "Politics/Geo"
+    if any(w in q for w in ["nba", "nfl", "spread:", "o/u", "vs.", "win on", "beat",
+                             "baseball", "reds", "braves", "astros", "nationals",
+                             "texans", "chargers", "knicks", "lakers", "76ers",
+                             "raptors", "sabres", "warriors", "suns"]):
+        return "Sports"
+    if any(w in q for w in ["counter-strike", "dota", "esports", "bo3", "lol:"]):
+        return "Esports"
+    if any(w in q for w in ["temperature", "weather", "°f", "°c"]):
+        return "Weather"
+    if any(w in q for w in ["tweet", "musk post", 'say "', "tweets from"]):
+        return "Speech/Social"
+    if any(w in q for w in ["chelsea", "manchester", "palmeiras", "brugge", "lyonnais",
+                             "marseille", "barcelona", "atletico", "villarreal", "nice",
+                             "bratislava", "crystal palace", "aston villa", "swiatek",
+                             "open:", "groningen", "rio open", "mexican open"]):
+        return "Soccer/Tennis"
+    return "Other"
 
 
-def week_start_date(week_str: str) -> str:
-    """Convert 'YYYY-WXX' back to the Monday date for display."""
-    year, w = week_str.split("-W")
-    dt = datetime.strptime(f"{year} {w} 1", "%G %V %u")
-    return dt.strftime("%b %d")
+def fetch_dataset(
+    target_count: int,
+    min_volume: float = 5000,
+    max_days_old: int = None,
+    exclude_categories: set = None,
+) -> list[dict]:
+    """
+    Paginate through Polymarket API to build a test set.
+    Applies recency filter and category exclusions at fetch time
+    so excluded markets don't count against target_count.
+    """
+    exclude_categories = exclude_categories or set()
+    recency_label = f"last {max_days_old} day(s)" if max_days_old else "all time"
 
+    logger.info(
+        f"Fetching resolved markets "
+        f"(target={target_count}, min_vol=${min_volume:,.0f}, recency={recency_label}"
+        + (f", excluding={sorted(exclude_categories)}" if exclude_categories else "")
+        + ")..."
+    )
 
-def compute_weekly_stats(log: list[dict]) -> dict:
-    """Group trade log entries by week and compute stats."""
-    weeks = defaultdict(lambda: {
-        "decisions": 0,
-        "bets": [],
-        "skips": 0,
-        "failures": 0,
-        "total_stake": 0.0,
-        "edges": [],
-        "probabilities": [],
-        "resolved": [],
-        "directions": {"YES": 0, "NO": 0},
-    })
+    cutoff_dt = None
+    if max_days_old is not None:
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=max_days_old)
 
-    for entry in log:
-        ts = entry.get("timestamp", "")
-        if not ts:
-            continue
-        wk = week_key(ts)
-        w = weeks[wk]
-        w["decisions"] += 1
+    results = []
+    limit = 100
+    offset = 0
+    skipped_recency = 0
+    skipped_category = 0
+    pages_fetched = 0
 
-        action = entry.get("action_taken", "")
-        stake = entry.get("stake_usd", 0)
+    while len(results) < target_count:
+        params = {
+            "closed": "true",
+            "limit": limit,
+            "offset": offset,
+            "order": "volume",
+            "ascending": "false",
+        }
 
-        if "BET" in action:
-            w["bets"].append(entry)
-            w["total_stake"] += stake
-            direction = entry.get("edge_direction", "")
-            if direction in w["directions"]:
-                w["directions"][direction] += 1
-            if "abs_edge" in entry:
-                w["edges"].append(entry["abs_edge"])
-            if "model_probability" in entry:
-                w["probabilities"].append(entry["model_probability"])
-        elif "SKIP" in action:
-            w["skips"] += 1
-        elif "FAIL" in action:
-            w["failures"] += 1
+        try:
+            resp = requests.get(f"{GAMMA_API_BASE}/markets", params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            logger.error(f"API Error: {e}")
+            break
 
-        # Track resolved outcomes
-        if "outcome_value" in entry and "model_probability" in entry:
-            w["resolved"].append({
-                "forecast": entry["model_probability"],
-                "actual": entry["outcome_value"],
-                "stake": stake,
-                "direction": entry.get("edge_direction", ""),
-                "market_price": entry.get("market_yes_price", 0.5),
+        if not data:
+            logger.info("No more pages from API.")
+            break
+
+        pages_fetched += 1
+        found_this_page = 0
+
+        for m in data:
+            prices = json.loads(m.get("outcomePrices", "[]"))
+            if len(prices) < 2:
+                continue
+
+            yes_price = float(prices[0])
+            vol = float(m.get("volume", 0))
+
+            if 0.05 < yes_price < 0.95:
+                continue
+            if vol < min_volume:
+                continue
+
+            q = m.get("question", "")
+            if len(q) < 15:
+                continue
+
+            # ── Recency filter ─────────────────────────────────────────────
+            if cutoff_dt is not None:
+                end_date_str = m.get("endDateIso") or m.get("endDate", "")
+                if not end_date_str:
+                    skipped_recency += 1
+                    continue
+                try:
+                    end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=timezone.utc)
+                    if end_dt < cutoff_dt:
+                        skipped_recency += 1
+                        continue
+                except ValueError:
+                    skipped_recency += 1
+                    continue
+
+            # ── Category exclusion ─────────────────────────────────────────
+            category = categorize(q)
+            if category in exclude_categories:
+                skipped_category += 1
+                continue
+
+            outcome = "YES" if yes_price >= 0.95 else "NO"
+            end_date = (m.get("endDateIso") or m.get("endDate", ""))[:10]
+
+            results.append({
+                "id": str(m.get("id", "")),
+                "question": q,
+                "description": m.get("description", "")[:500],
+                "outcome": outcome,
+                "volume": vol,
+                "category": category,
+                "end_date": end_date,
             })
+            found_this_page += 1
 
-    return dict(sorted(weeks.items()))
+            if len(results) >= target_count:
+                break
 
+        logger.info(
+            f"  Page {pages_fetched} (offset={offset}): "
+            f"+{found_this_page} valid | total={len(results)} | "
+            f"recency_skip={skipped_recency} | cat_skip={skipped_category}"
+        )
 
-def simulate_pnl(resolved: list[dict]) -> dict:
-    """
-    Simulate P&L on resolved bets.
-    YES bet wins if outcome=1, NO bet wins if outcome=0.
-    Payout is (1/price_paid) * stake if win, lose stake if loss.
-    """
-    if not resolved:
-        return {"wins": 0, "losses": 0, "pnl": 0.0, "roi": 0.0}
+        # Stop paginating if recency filter yields nothing new
+        if cutoff_dt is not None and found_this_page == 0 and pages_fetched > 1:
+            logger.info("No recent markets on this page — stopping pagination.")
+            break
 
-    wins = losses = 0
-    total_pnl = 0.0
-    total_staked = 0.0
+        offset += limit
+        time.sleep(0.8)
 
-    for r in resolved:
-        stake = r["stake"]
-        direction = r["direction"]
-        actual = r["actual"]
-        market_price = r["market_price"]
+    if skipped_recency:
+        logger.info(f"Total skipped (recency): {skipped_recency}")
+    if skipped_category:
+        logger.info(f"Total skipped (category): {skipped_category}")
 
-        if stake <= 0:
-            continue
-
-        total_staked += stake
-
-        if direction == "YES":
-            cost = market_price
-            won = actual == 1.0
-        else:
-            cost = 1 - market_price
-            won = actual == 0.0
-
-        if won:
-            profit = stake * (1 / cost - 1)  # payout minus cost
-            total_pnl += profit
-            wins += 1
-        else:
-            total_pnl -= stake
-            losses += 1
-
-    roi = (total_pnl / total_staked * 100) if total_staked > 0 else 0
-    return {"wins": wins, "losses": losses, "pnl": round(total_pnl, 2), "roi": round(roi, 1)}
+    logger.info(f"Dataset ready: {len(results)} markets.")
+    return results
 
 
-def brier_score(resolved: list[dict]) -> float | None:
-    if not resolved:
+def run_backtest_market(
+    market_data: dict,
+    backend,
+    bankroll: float,
+    edge_threshold: float,
+    slippage: float,
+) -> StrictBacktestResult | None:
+    """Analyze one resolved market and compute simulated P&L."""
+    market = Market(
+        id=market_data["id"],
+        question=market_data["question"],
+        description=market_data["description"],
+        yes_price=0.50,
+        no_price=0.50,
+        volume=market_data["volume"],
+        liquidity=0,
+        end_date=market_data["end_date"],
+        active=False,
+        slug="",
+    )
+
+    analysis = analyze_market(market, backend, include_news=False)
+    if analysis is None:
         return None
-    total = sum((r["forecast"] - r["actual"]) ** 2 for r in resolved)
-    return round(total / len(resolved), 4)
+
+    model_prob = analysis.estimated_probability
+    actual_outcome = market_data["outcome"]
+
+    exec_price_yes = 0.50 + slippage
+    exec_price_no  = 0.50 + slippage
+
+    if model_prob > exec_price_yes + edge_threshold:
+        direction   = "YES"
+        edge        = model_prob - exec_price_yes
+        stake_price = exec_price_yes
+    elif (1 - model_prob) > exec_price_no + edge_threshold:
+        direction   = "NO"
+        edge        = (1 - model_prob) - exec_price_no
+        stake_price = exec_price_no
+    else:
+        direction   = "SKIP"
+        edge        = 0.0
+        stake_price = 0.50
+
+    stake = 0.0
+    won   = False
+    pnl   = 0.0
+
+    if direction != "SKIP":
+        stake = kelly_stake(bankroll, edge, stake_price, direction, max_pct=0.10)
+        won   = (direction == actual_outcome)
+        pnl   = stake * (1 / stake_price - 1) if won else -stake
+
+    return StrictBacktestResult(
+        market_id=market_data["id"],
+        question=market_data["question"][:70],
+        category=market_data["category"],
+        actual_outcome=actual_outcome,
+        model_probability=model_prob,
+        direction=direction,
+        stake=stake,
+        won=won,
+        pnl=pnl,
+        end_date=market_data["end_date"],
+    )
+
+
+def print_report(
+    results: list[StrictBacktestResult],
+    slippage: float,
+    backend_name: str,
+    max_days_old: int | None,
+    excluded: set,
+):
+    recency_label = f"last {max_days_old} day(s)" if max_days_old else "all time"
+
+    print("\n" + "═" * 72)
+    print(f"  📊 BACKTEST RESULTS")
+    print(f"  Model    : {backend_name}")
+    print(f"  Recency  : {recency_label}  |  Slippage: {slippage:.1%}")
+    if excluded:
+        print(f"  Excluded : {', '.join(sorted(excluded))}")
+    print("═" * 72)
+
+    if not results:
+        print("  No results to display.")
+        return
+
+    print(f"\n  {'#':<4} {'✓/✗':<3} {'Prob':>5} {'Act':<4} {'Bet':<5} {'P&L':>8}  {'Category':<14}  Question")
+    print("  " + "─" * 90)
+
+    for i, r in enumerate(results, 1):
+        if r.direction == "SKIP":
+            icon, pnl_str = "⏭", "      —"
+        elif r.won:
+            icon, pnl_str = "✅", f"${r.pnl:+7.2f}"
+        else:
+            icon, pnl_str = "❌", f"${r.pnl:+7.2f}"
+
+        print(
+            f"  {i:<4} {icon:<3} {r.model_probability:>4.0%}  "
+            f"{r.actual_outcome:<4} {r.direction:<5} {pnl_str}  "
+            f"{r.category:<14}  {r.question[:42]}"
+        )
+
+    # ── Overall metrics ────────────────────────────────────────────────────
+    bets  = [r for r in results if r.direction != "SKIP"]
+    wins  = [r for r in bets if r.won]
+    skips = [r for r in results if r.direction == "SKIP"]
+
+    total_pnl    = sum(r.pnl for r in bets)
+    total_staked = sum(r.stake for r in bets)
+    roi          = (total_pnl / total_staked * 100) if total_staked > 0 else 0
+
+    brier_sum = sum(
+        (r.model_probability - (1.0 if r.actual_outcome == "YES" else 0.0)) ** 2
+        for r in results
+    )
+    brier   = brier_sum / len(results)
+    win_pct = len(wins) / len(bets) * 100 if bets else 0
+
+    print(f"\n{'─' * 72}")
+    print(f"  OVERALL")
+    print(f"  Markets analyzed : {len(results)}  ({len(skips)} skipped, {len(bets)} bets)")
+    print(f"  Win / Loss       : {len(wins)}W / {len(bets)-len(wins)}L  ({win_pct:.0f}% win rate)")
+    print(f"  Total staked     : ${total_staked:.2f}")
+    print(f"  Net P&L          : ${total_pnl:+.2f}")
+    print(f"  ROI              : {roi:+.1f}%")
+    print(f"  Brier Score      : {brier:.4f}  ", end="")
+    if brier < 0.15:
+        print("🏆 Excellent")
+    elif brier < 0.20:
+        print("👍 Good")
+    elif brier < 0.25:
+        print("⚠️  Baseline (marginal skill)")
+    else:
+        print("🚨 Poor — no better than random")
+
+    # ── Category breakdown ─────────────────────────────────────────────────
+    print(f"\n  CATEGORY BREAKDOWN")
+    print(f"  {'Category':<16} {'N':>4} {'Bets':>5} {'Win%':>6} {'P&L':>9} {'Brier':>7}  Verdict")
+    print("  " + "─" * 72)
+
+    cats = defaultdict(lambda: {"n": 0, "bets": 0, "wins": 0, "pnl": 0.0, "brier_sum": 0.0})
+    for r in results:
+        c = cats[r.category]
+        c["n"] += 1
+        c["brier_sum"] += (r.model_probability - (1.0 if r.actual_outcome == "YES" else 0.0)) ** 2
+        if r.direction != "SKIP":
+            c["bets"] += 1
+            if r.won:
+                c["wins"] += 1
+            c["pnl"] += r.pnl
+
+    for cat in sorted(cats, key=lambda x: -cats[x]["n"]):
+        c = cats[cat]
+        c_brier   = c["brier_sum"] / c["n"]
+        c_win_pct = (c["wins"] / c["bets"] * 100) if c["bets"] > 0 else 0
+
+        if c["n"] < 5:
+            verdict = "🟡 Needs more data"
+        elif c["bets"] == 0:
+            verdict = "⏭  All skipped"
+        elif c_win_pct >= 60 and c["pnl"] > 0 and c_brier < 0.22:
+            verdict = "✅ Approved"
+        elif c_win_pct >= 55 and c["pnl"] > 0:
+            verdict = "⚠️  Borderline"
+        else:
+            verdict = "❌ Reject"
+
+        print(
+            f"  {cat:<16} {c['n']:>4} {c['bets']:>5} {c_win_pct:>5.0f}%  "
+            f"${c['pnl']:>7.2f} {c_brier:>7.3f}  {verdict}"
+        )
+
+    # ── Final verdict ──────────────────────────────────────────────────────
+    print(f"\n{'═' * 72}")
+    if brier < 0.18 and roi > 0 and win_pct >= 55:
+        print("  ✅ GREEN LIGHT — Model is calibrated and profitable.")
+        print("     Ready for cautious live trading.")
+    elif brier < 0.23 or roi > 0:
+        print("  🟡 YELLOW — Some skill detected, needs more data.")
+        print("     Continue dry-run and monitor.")
+    else:
+        print("  🔴 RED — Model not performing well enough for live trading.")
+        print("     Try a stronger model or refine prompts.")
+    print()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Weekly performance report")
-    parser.add_argument("--weeks", type=int, default=0, help="Show only last N weeks (0=all)")
+    parser = argparse.ArgumentParser(
+        description="Backtest model on recently resolved Polymarket markets",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Category names (for --exclude-categories):
+  {chr(10).join('  ' + c for c in ALL_CATEGORIES)}
+
+Examples:
+  # Exclude noisy short-window crypto markets (recommended)
+  python backtest_2.py --days 7 --exclude-categories "Crypto Price"
+
+  # Focus on high-signal markets only
+  python backtest_2.py --days 30 --min-volume 50000 \\
+      --exclude-categories "Crypto Price" "Esports" "Speech/Social"
+
+  # See all available categories
+  python backtest_2.py --list-categories
+        """
+    )
+    parser.add_argument("--days",           type=int,   default=7,
+                        help="Only test markets resolved in last N days (default: 7)")
+    parser.add_argument("--markets",        type=int,   default=100,
+                        help="Max markets to fetch (default: 100)")
+    parser.add_argument("--min-volume",     type=float, default=5000,
+                        help="Minimum volume filter (default: $5,000)")
+    parser.add_argument("--slippage",       type=float, default=0.02,
+                        help="Slippage penalty (default: 0.02 = 2%%)")
+    parser.add_argument("--edge-threshold", type=float, default=0.08,
+                        help="Min edge over slippage to bet (default: 8%%)")
+    parser.add_argument("--bankroll",       type=float, default=1000,
+                        help="Simulated bankroll for Kelly sizing (default: $1000)")
+    parser.add_argument("--no-days",        action="store_true",
+                        help="Disable recency filter (fetch all time)")
+    parser.add_argument(
+        "--exclude-categories", nargs="+", metavar="CATEGORY", default=[],
+        help='Categories to skip. e.g. --exclude-categories "Crypto Price" "Esports"'
+    )
+    parser.add_argument("--list-categories", action="store_true",
+                        help="Print all valid category names and exit")
     args = parser.parse_args()
 
-    log = load_log()
-    if not log:
-        print("No trade history found. Run the agent first!")
+    # ── --list-categories ──────────────────────────────────────────────────
+    if args.list_categories:
+        print("\n📋 Valid category names for --exclude-categories:\n")
+        for cat in ALL_CATEGORIES:
+            print(f'  "{cat}"')
+        print(f'\nExample:')
+        print(f'  python backtest_2.py --exclude-categories "Crypto Price" "Esports"\n')
         return
 
-    weekly = compute_weekly_stats(log)
+    # ── Validate ───────────────────────────────────────────────────────────
+    excluded = set(args.exclude_categories)
+    invalid  = excluded - set(ALL_CATEGORIES)
+    if invalid:
+        print(f"\n❌ Unknown categories: {invalid}")
+        print(f"   Run --list-categories to see valid options.\n")
+        return
 
-    if args.weeks > 0:
-        keys = list(weekly.keys())[-args.weeks:]
-        weekly = {k: weekly[k] for k in keys}
+    max_days = None if args.no_days else args.days
 
-    # ── Header ───────────────────────────────────────────────────────────
+    try:
+        backend = get_backend()
+    except ValueError as e:
+        print(f"❌ {e}")
+        return
+
+    print(f"\n🧪 Polymarket Backtest — Recently Resolved Markets")
+    print(f"   Model     : {backend.name}")
+    print(f"   Recency   : {'No filter' if max_days is None else f'Last {max_days} day(s)'}")
+    print(f"   Markets   : up to {args.markets}")
+    print(f"   Min volume: ${args.min_volume:,.0f}")
+    print(f"   Slippage  : {args.slippage:.1%}")
+    print(f"   Edge bar  : {args.edge_threshold:.1%} over slippage")
+    if excluded:
+        print(f"   Excluded  : {', '.join(sorted(excluded))}")
     print()
-    print("╔══════════════════════════════════════════════════════════════╗")
-    print("║              📊 Weekly Performance Report                   ║")
-    print("╚══════════════════════════════════════════════════════════════╝")
 
-    # ── Weekly Table ─────────────────────────────────────────────────────
-    print(f"\n  {'Week':<10} {'Start':<8} {'Bets':<6} {'Skip':<6} {'Staked':>8} "
-          f"{'Avg Edge':>9} {'YES/NO':<8} {'Brier':>7} {'P&L':>8}")
-    print(f"  {'─'*72}")
+    markets = fetch_dataset(
+        target_count=args.markets,
+        min_volume=args.min_volume,
+        max_days_old=max_days,
+        exclude_categories=excluded,
+    )
 
-    totals = {"bets": 0, "skips": 0, "stake": 0.0, "edges": [], "resolved": [], "decisions": 0}
+    if not markets:
+        print("❌ No markets found. Try --no-days, lower --min-volume, or fewer exclusions.")
+        return
 
-    for wk, stats in weekly.items():
-        n_bets = len(stats["bets"])
-        avg_edge = sum(stats["edges"]) / len(stats["edges"]) if stats["edges"] else 0
-        brier = brier_score(stats["resolved"])
-        pnl_data = simulate_pnl(stats["resolved"])
-        yes_no = f"{stats['directions']['YES']}/{stats['directions']['NO']}"
-        start = week_start_date(wk)
+    yes_n = sum(1 for m in markets if m["outcome"] == "YES")
+    cat_counts = defaultdict(int)
+    for m in markets:
+        cat_counts[m["category"]] += 1
 
-        brier_str = f"{brier:.3f}" if brier is not None else "  —"
-        pnl_str = f"${pnl_data['pnl']:+.2f}" if stats["resolved"] else "  —"
+    print(f"  Test set  : {len(markets)} markets  ({yes_n} YES / {len(markets)-yes_n} NO)")
+    print(f"  By category: {dict(sorted(cat_counts.items(), key=lambda x: -x[1]))}\n")
 
-        print(f"  {wk:<10} {start:<8} {n_bets:<6} {stats['skips']:<6} "
-              f"${stats['total_stake']:>7.2f} {avg_edge:>8.1%} {yes_no:<8} "
-              f"{brier_str:>7} {pnl_str:>8}")
-
-        totals["bets"] += n_bets
-        totals["skips"] += stats["skips"]
-        totals["stake"] += stats["total_stake"]
-        totals["edges"].extend(stats["edges"])
-        totals["resolved"].extend(stats["resolved"])
-        totals["decisions"] += stats["decisions"]
-
-    # ── Totals ───────────────────────────────────────────────────────────
-    print(f"  {'─'*72}")
-    total_avg_edge = sum(totals["edges"]) / len(totals["edges"]) if totals["edges"] else 0
-    total_brier = brier_score(totals["resolved"])
-    total_pnl = simulate_pnl(totals["resolved"])
-    brier_str = f"{total_brier:.3f}" if total_brier is not None else "  —"
-    pnl_str = f"${total_pnl['pnl']:+.2f}" if totals["resolved"] else "  —"
-
-    print(f"  {'TOTAL':<10} {'':8} {totals['bets']:<6} {totals['skips']:<6} "
-          f"${totals['stake']:>7.2f} {total_avg_edge:>8.1%} {'':8} "
-          f"{brier_str:>7} {pnl_str:>8}")
-
-    # ── Summary ──────────────────────────────────────────────────────────
-    print(f"\n{'─'*64}")
-    print(f"  Total decisions:  {totals['decisions']}")
-    print(f"  Total bets:       {totals['bets']}")
-    print(f"  Total staked:     ${totals['stake']:.2f}")
-    print(f"  Avg edge/bet:     {total_avg_edge:.1%}")
-
-    if totals["resolved"]:
-        print(f"\n  ── Resolved Bets ──")
-        print(f"  Win/Loss:         {total_pnl['wins']}W / {total_pnl['losses']}L")
-        print(f"  Net P&L:          ${total_pnl['pnl']:+.2f}")
-        print(f"  ROI:              {total_pnl['roi']:+.1f}%")
-        print(f"  Brier Score:      {total_brier:.4f}")
-
-        if total_brier < 0.10:
-            print(f"  Verdict:          🏆 Excellent — beating the market")
-        elif total_brier < 0.20:
-            print(f"  Verdict:          👍 Good signal — consider live trading")
-        elif total_brier < 0.26:
-            print(f"  Verdict:          ⚠️  Baseline — no better than market")
+    results = []
+    for i, m in enumerate(markets, 1):
+        print(f"  [{i:>3}/{len(markets)}] {m['outcome']} | [{m['category']}] {m['question'][:55]}")
+        res = run_backtest_market(m, backend, args.bankroll, args.edge_threshold, args.slippage)
+        if res:
+            icon = "✅" if res.won else ("❌" if res.direction != "SKIP" else "⏭ ")
+            print(f"         {icon} Pred={res.model_probability:.0%} | Bet={res.direction} | P&L=${res.pnl:+.2f}")
+            results.append(res)
         else:
-            print(f"  Verdict:          🚨 Poor — needs rework")
-    else:
-        print(f"\n  ⏳ No resolved bets yet. Markets need to expire first.")
-        print(f"     Run: python resolve.py")
+            print("         ⚠️  Analysis failed")
+        time.sleep(1.5)
 
-    print()
+    print_report(results, args.slippage, backend.name, max_days, excluded)
 
 
 if __name__ == "__main__":
     main()
+</file>
+
+<file path="requirements.txt">
+requests>=2.31.0
+python-dotenv>=1.0.0
+groq>=0.4.0
+openai>=1.30.0
+ddgs>=7.0.0
 </file>
 
 <file path="resolve.py">
@@ -2665,557 +3326,6 @@ def calculate_edge(market: Market, analysis: AnalysisResult) -> dict:
         "has_edge": abs(raw_edge) >= threshold,
         "threshold": threshold,
     }
-</file>
-
-<file path="backtest_2.py">
-#!/usr/bin/env python3
-"""
-Stringent Categorical Backtester (Phase 1-3)
-─────────────────────────────────────────────
-Fetches resolved markets from Polymarket to rigorously validate the
-model's edge before live trading.
-
-Features:
-- --days filter: only test markets resolved in the last N days
-- --exclude-categories: skip specific categories (e.g. "Crypto Price")
-- --list-categories: print all valid category names
-- Categorization (Politics, Weather, Crypto Token, etc.)
-- Pagination to bypass API limits
-- Simulated execution slippage penalty
-- Strict success thresholds per category
-
-Usage:
-    python backtest_2.py --days 7 --markets 100
-    python backtest_2.py --days 7 --exclude-categories "Crypto Price"
-    python backtest_2.py --days 30 --min-volume 50000 --exclude-categories "Crypto Price" "Esports"
-    python backtest_2.py --list-categories
-"""
-
-import argparse
-import json
-import logging
-import time
-from collections import defaultdict
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-
-import requests
-from dotenv import load_dotenv
-
-from src.agent import get_backend, analyze_market
-from src.market import Market
-from src.trader import kelly_stake
-
-load_dotenv()
-
-for lib in ["urllib3", "requests", "primp", "h2", "rustls", "hyper_util", "cookie_store", "ddgs"]:
-    logging.getLogger(lib).setLevel(logging.WARNING)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger(__name__)
-
-GAMMA_API_BASE = "https://gamma-api.polymarket.com"
-
-ALL_CATEGORIES = [
-    "Crypto Price",
-    "Crypto Token",
-    "Politics/Geo",
-    "Sports",
-    "Esports",
-    "Weather",
-    "Speech/Social",
-    "Soccer/Tennis",
-    "Other",
-]
-
-
-@dataclass
-class StrictBacktestResult:
-    market_id: str
-    question: str
-    category: str
-    actual_outcome: str
-    model_probability: float
-    direction: str
-    stake: float
-    won: bool
-    pnl: float
-    end_date: str
-
-
-def categorize(q: str) -> str:
-    """Categorize market based on question content."""
-    q = q.lower()
-    if any(w in q for w in ["bitcoin", "btc", "ethereum", "eth", "xrp", "solana", "crypto"]):
-        return "Crypto Price"
-    if any(w in q for w in ["fdv", "pump.fun", "superform", "aztec", "launch", "airdrop"]):
-        return "Crypto Token"
-    if any(w in q for w in ["trump", "pardon", "election", "democrat", "republican",
-                             "primary", "vote", "cabinet", "president", "congress",
-                             "nato", "israel", "saudi", "russia", "ukraine"]):
-        return "Politics/Geo"
-    if any(w in q for w in ["nba", "nfl", "spread:", "o/u", "vs.", "win on", "beat",
-                             "baseball", "reds", "braves", "astros", "nationals",
-                             "texans", "chargers", "knicks", "lakers", "76ers",
-                             "raptors", "sabres", "warriors", "suns"]):
-        return "Sports"
-    if any(w in q for w in ["counter-strike", "dota", "esports", "bo3", "lol:"]):
-        return "Esports"
-    if any(w in q for w in ["temperature", "weather", "°f", "°c"]):
-        return "Weather"
-    if any(w in q for w in ["tweet", "musk post", 'say "', "tweets from"]):
-        return "Speech/Social"
-    if any(w in q for w in ["chelsea", "manchester", "palmeiras", "brugge", "lyonnais",
-                             "marseille", "barcelona", "atletico", "villarreal", "nice",
-                             "bratislava", "crystal palace", "aston villa", "swiatek",
-                             "open:", "groningen", "rio open", "mexican open"]):
-        return "Soccer/Tennis"
-    return "Other"
-
-
-def fetch_dataset(
-    target_count: int,
-    min_volume: float = 5000,
-    max_days_old: int = None,
-    exclude_categories: set = None,
-) -> list[dict]:
-    """
-    Paginate through Polymarket API to build a test set.
-    Applies recency filter and category exclusions at fetch time
-    so excluded markets don't count against target_count.
-    """
-    exclude_categories = exclude_categories or set()
-    recency_label = f"last {max_days_old} day(s)" if max_days_old else "all time"
-
-    logger.info(
-        f"Fetching resolved markets "
-        f"(target={target_count}, min_vol=${min_volume:,.0f}, recency={recency_label}"
-        + (f", excluding={sorted(exclude_categories)}" if exclude_categories else "")
-        + ")..."
-    )
-
-    cutoff_dt = None
-    if max_days_old is not None:
-        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=max_days_old)
-
-    results = []
-    limit = 100
-    offset = 0
-    skipped_recency = 0
-    skipped_category = 0
-    pages_fetched = 0
-
-    while len(results) < target_count:
-        params = {
-            "closed": "true",
-            "limit": limit,
-            "offset": offset,
-            "order": "volume",
-            "ascending": "false",
-        }
-
-        try:
-            resp = requests.get(f"{GAMMA_API_BASE}/markets", params=params, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as e:
-            logger.error(f"API Error: {e}")
-            break
-
-        if not data:
-            logger.info("No more pages from API.")
-            break
-
-        pages_fetched += 1
-        found_this_page = 0
-
-        for m in data:
-            prices = json.loads(m.get("outcomePrices", "[]"))
-            if len(prices) < 2:
-                continue
-
-            yes_price = float(prices[0])
-            vol = float(m.get("volume", 0))
-
-            if 0.05 < yes_price < 0.95:
-                continue
-            if vol < min_volume:
-                continue
-
-            q = m.get("question", "")
-            if len(q) < 15:
-                continue
-
-            # ── Recency filter ─────────────────────────────────────────────
-            if cutoff_dt is not None:
-                end_date_str = m.get("endDateIso") or m.get("endDate", "")
-                if not end_date_str:
-                    skipped_recency += 1
-                    continue
-                try:
-                    end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                    if end_dt.tzinfo is None:
-                        end_dt = end_dt.replace(tzinfo=timezone.utc)
-                    if end_dt < cutoff_dt:
-                        skipped_recency += 1
-                        continue
-                except ValueError:
-                    skipped_recency += 1
-                    continue
-
-            # ── Category exclusion ─────────────────────────────────────────
-            category = categorize(q)
-            if category in exclude_categories:
-                skipped_category += 1
-                continue
-
-            outcome = "YES" if yes_price >= 0.95 else "NO"
-            end_date = (m.get("endDateIso") or m.get("endDate", ""))[:10]
-
-            results.append({
-                "id": str(m.get("id", "")),
-                "question": q,
-                "description": m.get("description", "")[:500],
-                "outcome": outcome,
-                "volume": vol,
-                "category": category,
-                "end_date": end_date,
-            })
-            found_this_page += 1
-
-            if len(results) >= target_count:
-                break
-
-        logger.info(
-            f"  Page {pages_fetched} (offset={offset}): "
-            f"+{found_this_page} valid | total={len(results)} | "
-            f"recency_skip={skipped_recency} | cat_skip={skipped_category}"
-        )
-
-        # Stop paginating if recency filter yields nothing new
-        if cutoff_dt is not None and found_this_page == 0 and pages_fetched > 1:
-            logger.info("No recent markets on this page — stopping pagination.")
-            break
-
-        offset += limit
-        time.sleep(0.8)
-
-    if skipped_recency:
-        logger.info(f"Total skipped (recency): {skipped_recency}")
-    if skipped_category:
-        logger.info(f"Total skipped (category): {skipped_category}")
-
-    logger.info(f"Dataset ready: {len(results)} markets.")
-    return results
-
-
-def run_backtest_market(
-    market_data: dict,
-    backend,
-    bankroll: float,
-    edge_threshold: float,
-    slippage: float,
-) -> StrictBacktestResult | None:
-    """Analyze one resolved market and compute simulated P&L."""
-    market = Market(
-        id=market_data["id"],
-        question=market_data["question"],
-        description=market_data["description"],
-        yes_price=0.50,
-        no_price=0.50,
-        volume=market_data["volume"],
-        liquidity=0,
-        end_date=market_data["end_date"],
-        active=False,
-        slug="",
-    )
-
-    analysis = analyze_market(market, backend, include_news=False)
-    if analysis is None:
-        return None
-
-    model_prob = analysis.estimated_probability
-    actual_outcome = market_data["outcome"]
-
-    exec_price_yes = 0.50 + slippage
-    exec_price_no  = 0.50 + slippage
-
-    if model_prob > exec_price_yes + edge_threshold:
-        direction   = "YES"
-        edge        = model_prob - exec_price_yes
-        stake_price = exec_price_yes
-    elif (1 - model_prob) > exec_price_no + edge_threshold:
-        direction   = "NO"
-        edge        = (1 - model_prob) - exec_price_no
-        stake_price = exec_price_no
-    else:
-        direction   = "SKIP"
-        edge        = 0.0
-        stake_price = 0.50
-
-    stake = 0.0
-    won   = False
-    pnl   = 0.0
-
-    if direction != "SKIP":
-        stake = kelly_stake(bankroll, edge, stake_price, direction, max_pct=0.10)
-        won   = (direction == actual_outcome)
-        pnl   = stake * (1 / stake_price - 1) if won else -stake
-
-    return StrictBacktestResult(
-        market_id=market_data["id"],
-        question=market_data["question"][:70],
-        category=market_data["category"],
-        actual_outcome=actual_outcome,
-        model_probability=model_prob,
-        direction=direction,
-        stake=stake,
-        won=won,
-        pnl=pnl,
-        end_date=market_data["end_date"],
-    )
-
-
-def print_report(
-    results: list[StrictBacktestResult],
-    slippage: float,
-    backend_name: str,
-    max_days_old: int | None,
-    excluded: set,
-):
-    recency_label = f"last {max_days_old} day(s)" if max_days_old else "all time"
-
-    print("\n" + "═" * 72)
-    print(f"  📊 BACKTEST RESULTS")
-    print(f"  Model    : {backend_name}")
-    print(f"  Recency  : {recency_label}  |  Slippage: {slippage:.1%}")
-    if excluded:
-        print(f"  Excluded : {', '.join(sorted(excluded))}")
-    print("═" * 72)
-
-    if not results:
-        print("  No results to display.")
-        return
-
-    print(f"\n  {'#':<4} {'✓/✗':<3} {'Prob':>5} {'Act':<4} {'Bet':<5} {'P&L':>8}  {'Category':<14}  Question")
-    print("  " + "─" * 90)
-
-    for i, r in enumerate(results, 1):
-        if r.direction == "SKIP":
-            icon, pnl_str = "⏭", "      —"
-        elif r.won:
-            icon, pnl_str = "✅", f"${r.pnl:+7.2f}"
-        else:
-            icon, pnl_str = "❌", f"${r.pnl:+7.2f}"
-
-        print(
-            f"  {i:<4} {icon:<3} {r.model_probability:>4.0%}  "
-            f"{r.actual_outcome:<4} {r.direction:<5} {pnl_str}  "
-            f"{r.category:<14}  {r.question[:42]}"
-        )
-
-    # ── Overall metrics ────────────────────────────────────────────────────
-    bets  = [r for r in results if r.direction != "SKIP"]
-    wins  = [r for r in bets if r.won]
-    skips = [r for r in results if r.direction == "SKIP"]
-
-    total_pnl    = sum(r.pnl for r in bets)
-    total_staked = sum(r.stake for r in bets)
-    roi          = (total_pnl / total_staked * 100) if total_staked > 0 else 0
-
-    brier_sum = sum(
-        (r.model_probability - (1.0 if r.actual_outcome == "YES" else 0.0)) ** 2
-        for r in results
-    )
-    brier   = brier_sum / len(results)
-    win_pct = len(wins) / len(bets) * 100 if bets else 0
-
-    print(f"\n{'─' * 72}")
-    print(f"  OVERALL")
-    print(f"  Markets analyzed : {len(results)}  ({len(skips)} skipped, {len(bets)} bets)")
-    print(f"  Win / Loss       : {len(wins)}W / {len(bets)-len(wins)}L  ({win_pct:.0f}% win rate)")
-    print(f"  Total staked     : ${total_staked:.2f}")
-    print(f"  Net P&L          : ${total_pnl:+.2f}")
-    print(f"  ROI              : {roi:+.1f}%")
-    print(f"  Brier Score      : {brier:.4f}  ", end="")
-    if brier < 0.15:
-        print("🏆 Excellent")
-    elif brier < 0.20:
-        print("👍 Good")
-    elif brier < 0.25:
-        print("⚠️  Baseline (marginal skill)")
-    else:
-        print("🚨 Poor — no better than random")
-
-    # ── Category breakdown ─────────────────────────────────────────────────
-    print(f"\n  CATEGORY BREAKDOWN")
-    print(f"  {'Category':<16} {'N':>4} {'Bets':>5} {'Win%':>6} {'P&L':>9} {'Brier':>7}  Verdict")
-    print("  " + "─" * 72)
-
-    cats = defaultdict(lambda: {"n": 0, "bets": 0, "wins": 0, "pnl": 0.0, "brier_sum": 0.0})
-    for r in results:
-        c = cats[r.category]
-        c["n"] += 1
-        c["brier_sum"] += (r.model_probability - (1.0 if r.actual_outcome == "YES" else 0.0)) ** 2
-        if r.direction != "SKIP":
-            c["bets"] += 1
-            if r.won:
-                c["wins"] += 1
-            c["pnl"] += r.pnl
-
-    for cat in sorted(cats, key=lambda x: -cats[x]["n"]):
-        c = cats[cat]
-        c_brier   = c["brier_sum"] / c["n"]
-        c_win_pct = (c["wins"] / c["bets"] * 100) if c["bets"] > 0 else 0
-
-        if c["n"] < 5:
-            verdict = "🟡 Needs more data"
-        elif c["bets"] == 0:
-            verdict = "⏭  All skipped"
-        elif c_win_pct >= 60 and c["pnl"] > 0 and c_brier < 0.22:
-            verdict = "✅ Approved"
-        elif c_win_pct >= 55 and c["pnl"] > 0:
-            verdict = "⚠️  Borderline"
-        else:
-            verdict = "❌ Reject"
-
-        print(
-            f"  {cat:<16} {c['n']:>4} {c['bets']:>5} {c_win_pct:>5.0f}%  "
-            f"${c['pnl']:>7.2f} {c_brier:>7.3f}  {verdict}"
-        )
-
-    # ── Final verdict ──────────────────────────────────────────────────────
-    print(f"\n{'═' * 72}")
-    if brier < 0.18 and roi > 0 and win_pct >= 55:
-        print("  ✅ GREEN LIGHT — Model is calibrated and profitable.")
-        print("     Ready for cautious live trading.")
-    elif brier < 0.23 or roi > 0:
-        print("  🟡 YELLOW — Some skill detected, needs more data.")
-        print("     Continue dry-run and monitor.")
-    else:
-        print("  🔴 RED — Model not performing well enough for live trading.")
-        print("     Try a stronger model or refine prompts.")
-    print()
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Backtest model on recently resolved Polymarket markets",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"""
-Category names (for --exclude-categories):
-  {chr(10).join('  ' + c for c in ALL_CATEGORIES)}
-
-Examples:
-  # Exclude noisy short-window crypto markets (recommended)
-  python backtest_2.py --days 7 --exclude-categories "Crypto Price"
-
-  # Focus on high-signal markets only
-  python backtest_2.py --days 30 --min-volume 50000 \\
-      --exclude-categories "Crypto Price" "Esports" "Speech/Social"
-
-  # See all available categories
-  python backtest_2.py --list-categories
-        """
-    )
-    parser.add_argument("--days",           type=int,   default=7,
-                        help="Only test markets resolved in last N days (default: 7)")
-    parser.add_argument("--markets",        type=int,   default=100,
-                        help="Max markets to fetch (default: 100)")
-    parser.add_argument("--min-volume",     type=float, default=5000,
-                        help="Minimum volume filter (default: $5,000)")
-    parser.add_argument("--slippage",       type=float, default=0.02,
-                        help="Slippage penalty (default: 0.02 = 2%%)")
-    parser.add_argument("--edge-threshold", type=float, default=0.08,
-                        help="Min edge over slippage to bet (default: 8%%)")
-    parser.add_argument("--bankroll",       type=float, default=1000,
-                        help="Simulated bankroll for Kelly sizing (default: $1000)")
-    parser.add_argument("--no-days",        action="store_true",
-                        help="Disable recency filter (fetch all time)")
-    parser.add_argument(
-        "--exclude-categories", nargs="+", metavar="CATEGORY", default=[],
-        help='Categories to skip. e.g. --exclude-categories "Crypto Price" "Esports"'
-    )
-    parser.add_argument("--list-categories", action="store_true",
-                        help="Print all valid category names and exit")
-    args = parser.parse_args()
-
-    # ── --list-categories ──────────────────────────────────────────────────
-    if args.list_categories:
-        print("\n📋 Valid category names for --exclude-categories:\n")
-        for cat in ALL_CATEGORIES:
-            print(f'  "{cat}"')
-        print(f'\nExample:')
-        print(f'  python backtest_2.py --exclude-categories "Crypto Price" "Esports"\n')
-        return
-
-    # ── Validate ───────────────────────────────────────────────────────────
-    excluded = set(args.exclude_categories)
-    invalid  = excluded - set(ALL_CATEGORIES)
-    if invalid:
-        print(f"\n❌ Unknown categories: {invalid}")
-        print(f"   Run --list-categories to see valid options.\n")
-        return
-
-    max_days = None if args.no_days else args.days
-
-    try:
-        backend = get_backend()
-    except ValueError as e:
-        print(f"❌ {e}")
-        return
-
-    print(f"\n🧪 Polymarket Backtest — Recently Resolved Markets")
-    print(f"   Model     : {backend.name}")
-    print(f"   Recency   : {'No filter' if max_days is None else f'Last {max_days} day(s)'}")
-    print(f"   Markets   : up to {args.markets}")
-    print(f"   Min volume: ${args.min_volume:,.0f}")
-    print(f"   Slippage  : {args.slippage:.1%}")
-    print(f"   Edge bar  : {args.edge_threshold:.1%} over slippage")
-    if excluded:
-        print(f"   Excluded  : {', '.join(sorted(excluded))}")
-    print()
-
-    markets = fetch_dataset(
-        target_count=args.markets,
-        min_volume=args.min_volume,
-        max_days_old=max_days,
-        exclude_categories=excluded,
-    )
-
-    if not markets:
-        print("❌ No markets found. Try --no-days, lower --min-volume, or fewer exclusions.")
-        return
-
-    yes_n = sum(1 for m in markets if m["outcome"] == "YES")
-    cat_counts = defaultdict(int)
-    for m in markets:
-        cat_counts[m["category"]] += 1
-
-    print(f"  Test set  : {len(markets)} markets  ({yes_n} YES / {len(markets)-yes_n} NO)")
-    print(f"  By category: {dict(sorted(cat_counts.items(), key=lambda x: -x[1]))}\n")
-
-    results = []
-    for i, m in enumerate(markets, 1):
-        print(f"  [{i:>3}/{len(markets)}] {m['outcome']} | [{m['category']}] {m['question'][:55]}")
-        res = run_backtest_market(m, backend, args.bankroll, args.edge_threshold, args.slippage)
-        if res:
-            icon = "✅" if res.won else ("❌" if res.direction != "SKIP" else "⏭ ")
-            print(f"         {icon} Pred={res.model_probability:.0%} | Bet={res.direction} | P&L=${res.pnl:+.2f}")
-            results.append(res)
-        else:
-            print("         ⚠️  Analysis failed")
-        time.sleep(1.5)
-
-    print_report(results, args.slippage, backend.name, max_days, excluded)
-
-
-if __name__ == "__main__":
-    main()
 </file>
 
 <file path="backtest.py">
@@ -4197,14 +4307,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-</file>
-
-<file path="requirements.txt">
-requests>=2.31.0
-python-dotenv>=1.0.0
-groq>=0.4.0
-openai>=1.30.0
-ddgs>=7.0.0
 </file>
 
 </files>
