@@ -220,8 +220,9 @@ class GroqBackend(LLMBackend):
                     self.base_url, headers=headers, json=payload, timeout=30
                 )
                 if resp.status_code == 429:
-                    wait = 5 * (attempt + 1)
-                    logger.warning(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/{max_retries})")
+                    retry_after = float(resp.headers.get("retry-after", 20 * (attempt + 1)))
+                    wait = max(retry_after, 20 * (attempt + 1))
+                    logger.warning(f"Rate limited, waiting {wait:.0f}s (attempt {attempt + 1}/{max_retries})")
                     _time.sleep(wait)
                     continue
                 resp.raise_for_status()
