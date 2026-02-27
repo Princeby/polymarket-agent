@@ -757,8 +757,12 @@ async def main():
     else:
         # Local dev mode — use polling
         logger.info("No WEBHOOK_URL set — using polling (local dev mode)")
-        await telegram_app.run_polling(drop_pending_updates=True)
-
+        async with telegram_app:
+            await telegram_app.start()
+            await telegram_app.updater.start_polling(drop_pending_updates=True)
+            await asyncio.Event().wait()  # run forever
+            await telegram_app.updater.stop()
+            await telegram_app.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
