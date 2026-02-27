@@ -57,13 +57,20 @@ def print_banner() -> None:
 # ── Category Filter ────────────────────────────────────────────────────────────
 
 HARD_BLOCK_PATTERNS = [
+    # Crypto short-window coin flips — model has zero edge
     "up or down - ",
     "up or down – ",
     "up or down on ",
+    "up or down",          # catches all variants
+    # Sports props — model has no edge
     "spread:",
     " o/u ",
     ": o/u ",
     "o/u ",
+    # Individual player props
+    "assists o/u",
+    "points o/u",
+    "rebounds o/u",
 ]
 
 POLITICS_PATTERNS = [

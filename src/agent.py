@@ -215,14 +215,13 @@ class GroqBackend(LLMBackend):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                _time.sleep(2)
+                _time.sleep(2.5)
                 resp = requests.post(
                     self.base_url, headers=headers, json=payload, timeout=30
                 )
                 if resp.status_code == 429:
-                    retry_after = float(resp.headers.get("retry-after", 20 * (attempt + 1)))
-                    wait = max(retry_after, 20 * (attempt + 1))
-                    logger.warning(f"Rate limited, waiting {wait:.0f}s (attempt {attempt + 1}/{max_retries})")
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/{max_retries})")
                     _time.sleep(wait)
                     continue
                 resp.raise_for_status()
@@ -276,20 +275,153 @@ class OllamaBackend(LLMBackend):
         except (KeyError, ValueError) as e:
             logger.error(f"Unexpected Ollama response format: {e}")
             return None
+class CerebrasBackend(LLMBackend):
+    """
+    Cerebras cloud API — free tier, same Llama models as Groq but much
+    higher rate limits and faster inference. OpenAI-compatible endpoint.
+    Get a free key at: https://cloud.cerebras.ai
+    """
+
+    def __init__(self):
+        self.api_key = os.getenv("CEREBRAS_API_KEY", "")
+        self.model   = os.getenv("CEREBRAS_MODEL", "llama-3.3-70b")
+        self.base_url = "https://api.cerebras.ai/v1/chat/completions"
+
+        if not self.api_key:
+            raise ValueError(
+                "CEREBRAS_API_KEY not set. Get a free key at https://cloud.cerebras.ai"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"Cerebras ({self.model})"
+
+    def query(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        import time as _time
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens":  1024,
+            "response_format": {"type": "json_object"},
+        }
+
+        for attempt in range(3):
+            try:
+                resp = requests.post(self.base_url, headers=headers, json=payload, timeout=30)
+
+                if resp.status_code == 429:
+                    retry_after = float(resp.headers.get("retry-after", 10 * (attempt + 1)))
+                    wait = max(retry_after, 10 * (attempt + 1))
+                    logger.warning(f"Cerebras rate limited, waiting {wait:.0f}s (attempt {attempt+1}/3)")
+                    _time.sleep(wait)
+                    continue
+
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+
+            except requests.RequestException as e:
+                logger.error(f"Cerebras API error: {e}")
+                return None
+            except (KeyError, IndexError) as e:
+                logger.error(f"Unexpected Cerebras response format: {e}")
+                return None
+
+        logger.error("Cerebras: max retries exceeded")
+        return None
+
+
+class GeminiBackend(LLMBackend):
+    """
+    Google Gemini free tier — generous rate limits, no credit card needed.
+    Uses gemini-1.5-flash by default (fast and cheap).
+    Get a free key at: https://aistudio.google.com/apikey
+    """
+
+    def __init__(self):
+        self.api_key = os.getenv("GEMINI_API_KEY", "")
+        self.model   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        self.base_url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{{}}/generateContent?key={self.api_key}"
+        )
+
+        if not self.api_key:
+            raise ValueError(
+                "GEMINI_API_KEY not set. Get a free key at https://aistudio.google.com/apikey"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"Gemini ({self.model})"
+
+    def query(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        import time as _time
+
+        url = self.base_url.format(self.model)
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": system_prompt}]
+            },
+            "contents": [
+                {"parts": [{"text": user_prompt}]}
+            ],
+            "generationConfig": {
+                "temperature":     0.2,
+                "maxOutputTokens": 1024,
+                "responseMimeType": "application/json",
+            },
+        }
+
+        for attempt in range(3):
+            try:
+                resp = requests.post(url, json=payload, timeout=30)
+
+                if resp.status_code == 429:
+                    wait = 15 * (attempt + 1)
+                    logger.warning(f"Gemini rate limited, waiting {wait}s (attempt {attempt+1}/3)")
+                    _time.sleep(wait)
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+
+            except requests.RequestException as e:
+                logger.error(f"Gemini API error: {e}")
+                return None
+            except (KeyError, IndexError) as e:
+                logger.error(f"Unexpected Gemini response format: {e}")
+                return None
+
+        logger.error("Gemini: max retries exceeded")
+        return None
 
 
 # ── Public Interface ───────────────────────────────────────────────────────────
 
 def get_backend() -> LLMBackend:
-    """Factory: return the right LLM backend based on LLM_BACKEND env var."""
     backend_name = os.getenv("LLM_BACKEND", "groq").lower()
     if backend_name == "ollama":
         return OllamaBackend()
+    elif backend_name == "cerebras":
+        return CerebrasBackend()
+    elif backend_name == "gemini":
+        return GeminiBackend()
     elif backend_name == "groq":
         return GroqBackend()
     else:
         raise ValueError(
-            f"Unknown LLM_BACKEND '{backend_name}'. Use 'groq' or 'ollama'."
+            f"Unknown LLM_BACKEND '{backend_name}'. "
+            f"Use 'groq', 'cerebras', 'gemini', or 'ollama'."
         )
 
 
