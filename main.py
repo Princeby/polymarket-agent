@@ -90,6 +90,11 @@ SPEECH_PATTERNS = [
     'say "',
     "will trump tweet",
     "will donald trump say",
+    # Generic catch-all for "Will X say Y" markets
+    ' say "',
+    'say \"',
+    "will musk say ",
+    "will biden tweet",
 ]
 
 SPORTS_PATTERNS = [
@@ -100,6 +105,30 @@ SPORTS_PATTERNS = [
     "will the suns ", "will the lakers ", "will the warriors ",
     "will the knicks ", "will the celtics ", "will the heat ",
     "will the 76ers", "will the raptors",
+]
+
+ESPORTS_PATTERNS = [
+    "counter-strike:",
+    "dota 2:",
+    "lol:",
+    "valorant:",
+    "esports",
+    "bo3",
+    "bo5",
+    "map 1 winner",
+    "map 2 winner",
+    "map 3 winner",
+    "game 1 winner",
+    "game 2 winner",
+    "game 3 winner",
+]
+
+SOCCER_TENNIS_PATTERNS = [
+    "mexican open",
+    "rio open",
+    "set handicap:",
+    "set 1 winner",
+    "both teams to score",
 ]
 
 
@@ -137,6 +166,14 @@ def should_skip_market(
     for pattern in HARD_BLOCK_PATTERNS:
         if pattern in q:
             return True, f"HARD_BLOCK:{pattern.strip().upper()}"
+    
+    for pattern in ESPORTS_PATTERNS:
+        if pattern in q:
+            return True, "ESPORTS"
+
+    for pattern in SOCCER_TENNIS_PATTERNS:
+        if pattern in q:
+            return True, "SOCCER_TENNIS"
 
     if not allow_politics:
         for pattern in POLITICS_PATTERNS:
@@ -152,6 +189,7 @@ def should_skip_market(
         for pattern in SPORTS_PATTERNS:
             if pattern in q:
                 return True, "SPORTS"
+    
 
     return False, ""
 
@@ -237,10 +275,19 @@ def run_cycle(
             )
             continue
 
-        # ── LLM Analysis ───────────────────────────────────────────────────────
+        # ── LLM Analysis (with retry) ──────────────────────────────────────────
         analysis = analyze_market(market, backend, include_news=use_news)
         if analysis is None:
-            print("  ⚠  Analysis failed — SKIP")
+            # Retry once: no news, shorter description → less likely to choke
+            logger.info("  ⟳  First attempt failed — retrying (no news, trimmed)...")
+            trimmed = market
+            if len(market.description) > 200:
+                from dataclasses import replace as _dc_replace
+                trimmed = _dc_replace(market, description=market.description[:200])
+            analysis = analyze_market(trimmed, backend, include_news=False)
+
+        if analysis is None:
+            print("  ⚠  Analysis failed (after retry) — SKIP")
             counts["skip_analysis_failed"] += 1
             trade_logger.log_decision(market, None, None, 0, "ANALYSIS_FAILED")
             continue
