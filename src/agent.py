@@ -351,7 +351,7 @@ class GeminiBackend(LLMBackend):
         self.model   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
         self.base_url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{{}}/generateContent?key={self.api_key}"
+            f"{{}}:generateContent?key={self.api_key}"
         )
 
         if not self.api_key:
@@ -376,7 +376,7 @@ class GeminiBackend(LLMBackend):
             ],
             "generationConfig": {
                 "temperature":     0.2,
-                "maxOutputTokens": 1024,
+                "maxOutputTokens": 8192,
                 "responseMimeType": "application/json",
             },
         }
@@ -406,23 +406,87 @@ class GeminiBackend(LLMBackend):
         return None
 
 
+class FallbackBackend(LLMBackend):
+    """
+    Wraps multiple backends and tries each in order.
+    If the primary backend returns None (rate-limit, error, etc.),
+    the next backend in the chain is tried automatically.
+    """
+
+    def __init__(self, backends: list[LLMBackend]):
+        if not backends:
+            raise ValueError("FallbackBackend requires at least one backend")
+        self._backends = backends
+
+    @property
+    def name(self) -> str:
+        return " → ".join(b.name for b in self._backends)
+
+    def query(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        for i, backend in enumerate(self._backends):
+            result = backend.query(system_prompt, user_prompt)
+            if result is not None:
+                if i > 0:
+                    logger.info(f"Succeeded with fallback backend: {backend.name}")
+                return result
+            if i < len(self._backends) - 1:
+                next_backend = self._backends[i + 1]
+                logger.warning(
+                    f"{backend.name} failed — falling back to {next_backend.name}"
+                )
+        logger.error("All backends exhausted, no response obtained")
+        return None
+
+
 # ── Public Interface ───────────────────────────────────────────────────────────
 
-def get_backend() -> LLMBackend:
-    backend_name = os.getenv("LLM_BACKEND", "groq").lower()
-    if backend_name == "ollama":
-        return OllamaBackend()
-    elif backend_name == "cerebras":
-        return CerebrasBackend()
-    elif backend_name == "gemini":
-        return GeminiBackend()
-    elif backend_name == "groq":
-        return GroqBackend()
-    else:
+_BACKEND_REGISTRY: dict[str, type[LLMBackend]] = {
+    "groq":     GroqBackend,
+    "ollama":   OllamaBackend,
+    "cerebras": CerebrasBackend,
+    "gemini":   GeminiBackend,
+}
+
+
+def _create_backend(name: str) -> LLMBackend:
+    """Instantiate a single backend by name."""
+    cls = _BACKEND_REGISTRY.get(name)
+    if cls is None:
         raise ValueError(
-            f"Unknown LLM_BACKEND '{backend_name}'. "
-            f"Use 'groq', 'cerebras', 'gemini', or 'ollama'."
+            f"Unknown backend '{name}'. "
+            f"Choose from: {', '.join(_BACKEND_REGISTRY)}"
         )
+    return cls()
+
+
+def get_backend() -> LLMBackend:
+    """
+    Build the LLM backend from env vars.
+
+    - LLM_BACKEND   : primary backend name (default: 'groq')
+    - LLM_FALLBACK   : comma-separated fallback backend names (optional)
+
+    Examples
+    --------
+    LLM_BACKEND=cerebras                      → Cerebras only
+    LLM_BACKEND=cerebras  LLM_FALLBACK=groq   → Cerebras, then Groq on failure
+    LLM_BACKEND=gemini    LLM_FALLBACK=cerebras,groq
+    """
+    primary_name = os.getenv("LLM_BACKEND", "groq").lower().strip()
+    primary = _create_backend(primary_name)
+
+    fallback_str = os.getenv("LLM_FALLBACK", "").strip()
+    if not fallback_str:
+        logger.info(f"Using LLM backend: {primary.name} (no fallback)")
+        return primary
+
+    fallback_names = [
+        n.strip().lower() for n in fallback_str.split(",") if n.strip()
+    ]
+    fallbacks = [_create_backend(n) for n in fallback_names]
+    chain = FallbackBackend([primary] + fallbacks)
+    logger.info(f"Using LLM backend chain: {chain.name}")
+    return chain
 
 
 def analyze_market(
